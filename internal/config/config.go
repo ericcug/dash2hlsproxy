@@ -33,7 +33,13 @@ type AppConfig struct {
 
 // LoadConfig reads the configuration file from the given path,
 // parses it, and preprocesses some fields (like keys and channel map).
-func LoadConfig(filePath string) (*AppConfig, error) {
+// The filePath can be overridden by the D2H_CHANNELS_JSON_PATH environment variable.
+func LoadConfig(defaultFilePath string) (*AppConfig, error) {
+	filePath := os.Getenv("D2H_CHANNELS_JSON_PATH")
+	if filePath == "" {
+		filePath = defaultFilePath
+	}
+
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config file %s: %w", filePath, err)

@@ -36,6 +36,7 @@ type AppContext struct {
 // GetMPD retrieves a parsed MPD for a channel, using a cache.
 // It returns the final URL from which the MPD was fetched, the parsed MPD, and an error.
 func (appCtx *AppContext) GetMPD(channelCfg *config.ChannelConfig) (string, *mpd.MPD, error) {
+	log.Printf("GetMPD: Called for channel %s (%s)", channelCfg.Name, channelCfg.ID)
 	appCtx.CacheLock.RLock()
 	cachedEntry, exists := appCtx.MPDCache[channelCfg.ID]
 	appCtx.CacheLock.RUnlock()
@@ -43,7 +44,7 @@ func (appCtx *AppContext) GetMPD(channelCfg *config.ChannelConfig) (string, *mpd
 	if exists {
 		cachedEntry.Mux.RLock()
 		if entryData := cachedEntry.Data; entryData != nil {
-			log.Printf("Using cached MPD for channel %s (%s), finalURL: %s", channelCfg.Name, channelCfg.ID, cachedEntry.FinalMPDURL)
+			log.Printf("GetMPD: Using cached MPD for channel %s (%s), finalURL: %s, FetchedAt: %s", channelCfg.Name, channelCfg.ID, cachedEntry.FinalMPDURL, cachedEntry.FetchedAt.Format(time.RFC3339))
 			dataCopy := *entryData
 			finalURLCopy := cachedEntry.FinalMPDURL
 			cachedEntry.LastAccessedAt = time.Now()
@@ -53,7 +54,7 @@ func (appCtx *AppContext) GetMPD(channelCfg *config.ChannelConfig) (string, *mpd
 		cachedEntry.Mux.RUnlock()
 	}
 
-	log.Printf("Fetching new MPD for channel %s (%s) from manifest: %s", channelCfg.Name, channelCfg.ID, channelCfg.Manifest)
+	log.Printf("GetMPD: Fetching new MPD for channel %s (%s) from manifest: %s", channelCfg.Name, channelCfg.ID, channelCfg.Manifest)
 
 	appCtx.CacheLock.Lock()
 	entry, ok := appCtx.MPDCache[channelCfg.ID]
@@ -69,7 +70,7 @@ func (appCtx *AppContext) GetMPD(channelCfg *config.ChannelConfig) (string, *mpd
 	defer entry.Mux.Unlock()
 
 	if entry.Data != nil {
-		log.Printf("MPD for channel %s (%s) was updated by another goroutine or already cached, using it. FinalURL: %s", channelCfg.Name, channelCfg.ID, entry.FinalMPDURL)
+		log.Printf("GetMPD: MPD for channel %s (%s) was updated by another goroutine or already cached, using it. FinalURL: %s, FetchedAt: %s", channelCfg.Name, channelCfg.ID, entry.FinalMPDURL, entry.FetchedAt.Format(time.RFC3339))
 		dataCopy := *entry.Data
 		finalURLCopy := entry.FinalMPDURL
 		entry.LastAccessedAt = time.Now()
@@ -78,18 +79,18 @@ func (appCtx *AppContext) GetMPD(channelCfg *config.ChannelConfig) (string, *mpd
 
 	urlToFetch := channelCfg.Manifest
 	if entry.FinalMPDURL != "" {
-		log.Printf("Attempting to refresh MPD from cached FinalMPDURL: %s", entry.FinalMPDURL)
+		log.Printf("GetMPD: Attempting to refresh MPD from cached FinalMPDURL: %s for channel %s (%s)", entry.FinalMPDURL, channelCfg.Name, channelCfg.ID)
 		urlToFetch = entry.FinalMPDURL
 	} else {
-		log.Printf("No cached FinalMPDURL, fetching from initial manifest URL: %s", channelCfg.Manifest)
+		log.Printf("GetMPD: No cached FinalMPDURL, fetching from initial manifest URL: %s for channel %s (%s)", channelCfg.Manifest, channelCfg.Name, channelCfg.ID)
 	}
 
 	newFinalURL, newMPDData, err := mpd.FetchAndParseMPD(urlToFetch, channelCfg.UserAgent)
 	if err != nil {
-		return "", nil, fmt.Errorf("GetMPD: error fetching from %s: %w", urlToFetch, err)
+		return "", nil, fmt.Errorf("GetMPD: error fetching from %s for channel %s (%s): %w", urlToFetch, channelCfg.Name, channelCfg.ID, err)
 	}
 
-	log.Printf("Updating cache for MPD channel %s (%s): new FinalMPDURL: %s", channelCfg.Name, channelCfg.ID, newFinalURL)
+	log.Printf("GetMPD: Successfully fetched new MPD for channel %s (%s). New FinalMPDURL: %s. MPD Type: %s", channelCfg.Name, channelCfg.ID, newFinalURL, newMPDData.Type)
 	entry.Data = newMPDData
 	entry.FetchedAt = time.Now()
 	entry.LastAccessedAt = time.Now()
@@ -98,16 +99,17 @@ func (appCtx *AppContext) GetMPD(channelCfg *config.ChannelConfig) (string, *mpd
 	if newMPDData.Type != "static" {
 		minUpdatePeriod, err := newMPDData.GetMinimumUpdatePeriod()
 		if err == nil && minUpdatePeriod > 0 {
-			log.Printf("Channel %s (%s) is dynamic with MinimumUpdatePeriod %s. Starting auto-updater.", channelCfg.Name, channelCfg.ID, minUpdatePeriod)
+			log.Printf("GetMPD: Channel %s (%s) is dynamic with MinimumUpdatePeriod %s. Starting auto-updater.", channelCfg.Name, channelCfg.ID, minUpdatePeriod)
 			go appCtx.autoUpdateMPD(channelCfg, entry, minUpdatePeriod)
 		} else if err != nil {
-			log.Printf("Channel %s (%s) is dynamic but error getting MinimumUpdatePeriod: %v. No auto-update.", channelCfg.Name, channelCfg.ID, err)
+			log.Printf("GetMPD: Channel %s (%s) is dynamic but error getting MinimumUpdatePeriod: %v. No auto-update.", channelCfg.Name, channelCfg.ID, err)
 		} else {
-			log.Printf("Channel %s (%s) is dynamic but MinimumUpdatePeriod is zero or not set. No auto-update.", channelCfg.Name, channelCfg.ID)
+			log.Printf("GetMPD: Channel %s (%s) is dynamic but MinimumUpdatePeriod is zero or not set. No auto-update.", channelCfg.Name, channelCfg.ID)
 		}
 	}
 
 	dataCopy := *newMPDData
+	log.Printf("GetMPD: Returning new MPD for channel %s (%s). FinalMPDURL: %s", channelCfg.Name, channelCfg.ID, newFinalURL)
 	return newFinalURL, &dataCopy, nil
 }
 
@@ -268,7 +270,7 @@ func (appCtx *AppContext) masterPlaylistHandler(w http.ResponseWriter, r *http.R
 
 	var playlist bytes.Buffer
 	playlist.WriteString("#EXTM3U\n")
-	playlist.WriteString("#EXT-X-VERSION:3\n")
+	playlist.WriteString("#EXT-X-VERSION:7\n")
 
 	audioGroupID := "audio_grp"
 	subtitleGroupID := "subs_grp"
@@ -349,8 +351,10 @@ func (appCtx *AppContext) masterPlaylistHandler(w http.ResponseWriter, r *http.R
 const NumLiveSegments = 5
 
 func (appCtx *AppContext) mediaPlaylistHandler(w http.ResponseWriter, r *http.Request, channelCfg *config.ChannelConfig, streamType string, qualityOrLang string, playlistFile string) {
-	log.Printf("Serving MEDIA playlist for channel %s (%s): type=%s, quality/lang=%s, file=%s",
-		channelCfg.Name, channelCfg.ID, streamType, qualityOrLang, playlistFile)
+	log.Printf("MediaPlaylistHandler: START - Request for channel %s (%s): type=%s, quality/lang=%s, file=%s, URL=%s",
+		channelCfg.Name, channelCfg.ID, streamType, qualityOrLang, playlistFile, r.URL.String())
+	defer log.Printf("MediaPlaylistHandler: END - Request for channel %s (%s): type=%s, quality/lang=%s, file=%s, URL=%s",
+		channelCfg.Name, channelCfg.ID, streamType, qualityOrLang, playlistFile, r.URL.String())
 
 	finalMPDURLStr, mpdData, err := appCtx.GetMPD(channelCfg)
 	if err != nil {
@@ -447,7 +451,7 @@ func (appCtx *AppContext) mediaPlaylistHandler(w http.ResponseWriter, r *http.Re
 
 	var playlist bytes.Buffer
 	playlist.WriteString("#EXTM3U\n")
-	playlist.WriteString("#EXT-X-VERSION:3\n")
+	playlist.WriteString("#EXT-X-VERSION:7\n")
 
 	maxSegDurSeconds := 0.0
 	timescale := uint64(1)
@@ -515,15 +519,36 @@ func (appCtx *AppContext) mediaPlaylistHandler(w http.ResponseWriter, r *http.Re
 	}
 	playlist.WriteString(fmt.Sprintf("#EXT-X-MEDIA-SEQUENCE:%d\n", startIndex))
 
+	segmentURLBasePath := fmt.Sprintf("/hls/%s/%s/%s/", channelCfg.ID, streamType, qualityOrLang)
+
+	// Add EXT-X-MAP for FMP4 initialization segment
+	if segTemplate.Initialization != "" {
+		initMediaURL := strings.ReplaceAll(segTemplate.Initialization, "$RepresentationID$", targetRep.ID)
+		// Assuming $Time$ and $Number$ are not typically in init segment patterns for MPD to HLS
+		// If they were, they would need to be handled or stripped if not applicable.
+
+		initializationSegmentFilename := initMediaURL
+		// If initMediaURL could be a full path, extract filename
+		if strings.Contains(initializationSegmentFilename, "/") {
+			initializationSegmentFilename = initializationSegmentFilename[strings.LastIndex(initializationSegmentFilename, "/")+1:]
+		}
+
+		// Construct the full URI for the #EXT-X-MAP tag, relative to the playlist's base path
+		// segmentURLBasePath is already defined as e.g., /hls/channelID/video/quality/
+		mapURI := segmentURLBasePath + initializationSegmentFilename
+		playlist.WriteString(fmt.Sprintf("#EXT-X-MAP:URI=\"%s\"\n", mapURI))
+		log.Printf("MediaPlaylist: Added EXT-X-MAP with URI: %s for %s/%s in channel %s", mapURI, streamType, qualityOrLang, channelCfg.ID)
+	} else {
+		log.Printf("MediaPlaylist: No Initialization pattern found in SegmentTemplate for %s/%s in channel %s. EXT-X-MAP not added.", streamType, qualityOrLang, channelCfg.ID)
+	}
+
 	if len(channelCfg.ParsedKey) > 0 {
 		keyURI := fmt.Sprintf("/hls/%s/key", channelCfg.ID)
 		log.Printf("MediaPlaylist: Adding EXT-X-KEY tag. URI: %s (IV omitted for CMAF)", keyURI)
-		playlist.WriteString(fmt.Sprintf("#EXT-X-KEY:METHOD=AES-128,URI=\"%s\",KEYFORMAT=\"identity\"\n", keyURI))
+		playlist.WriteString(fmt.Sprintf("#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"%s\",KEYFORMAT=\"identity\"\n", keyURI))
 	} else {
 		log.Printf("MediaPlaylist: No key defined for channel %s. Not adding EXT-X-KEY tag.", channelCfg.ID)
 	}
-
-	segmentURLBasePath := fmt.Sprintf("/hls/%s/%s/%s/", channelCfg.ID, streamType, qualityOrLang)
 
 	for i := startIndex; i < len(allSegments); i++ {
 		seg := allSegments[i]
@@ -541,8 +566,10 @@ func (appCtx *AppContext) mediaPlaylistHandler(w http.ResponseWriter, r *http.Re
 }
 
 func (appCtx *AppContext) segmentProxyHandler(w http.ResponseWriter, r *http.Request, channelCfg *config.ChannelConfig, streamType string, qualityOrLang string, segmentName string) {
-	log.Printf("Proxying SEGMENT for channel %s (%s): type=%s, quality/lang=%s, segment=%s",
-		channelCfg.Name, channelCfg.ID, streamType, qualityOrLang, segmentName)
+	log.Printf("SegmentProxyHandler: START - Request for channel %s (%s): type=%s, quality/lang=%s, segment=%s, URL=%s",
+		channelCfg.Name, channelCfg.ID, streamType, qualityOrLang, segmentName, r.URL.String())
+	defer log.Printf("SegmentProxyHandler: END - Request for channel %s (%s): type=%s, quality/lang=%s, segment=%s, URL=%s",
+		channelCfg.Name, channelCfg.ID, streamType, qualityOrLang, segmentName, r.URL.String())
 
 	finalMPDURLStr, mpdData, err := appCtx.GetMPD(channelCfg)
 	if err != nil {
@@ -708,68 +735,92 @@ func (appCtx *AppContext) segmentProxyHandler(w http.ResponseWriter, r *http.Req
 	}
 
 	upstreamURLStr := resolvedSegmentBaseURL + relativeSegmentPath
-	log.Printf("SegmentProxy: ---> Key URL Components for channel %s (%s): FinalMPDURL='%s', ResolvedSegmentBaseURL (before adding trailing slash)='%s', RelativeSegmentPath='%s', ConstructedUpstreamURLToFetch='%s'",
+	log.Printf("SegmentProxyHandler: ---> Key URL Components for channel %s (%s): FinalMPDURL='%s', ResolvedSegmentBaseURL (before adding trailing slash)='%s', RelativeSegmentPath='%s', ConstructedUpstreamURLToFetch='%s'",
 		channelCfg.Name, channelCfg.ID, finalMPDURLStr, strings.TrimSuffix(resolvedSegmentBaseURL, "/"), relativeSegmentPath, upstreamURLStr)
 
 	httpClient := &http.Client{Timeout: 20 * time.Second}
 	req, err := http.NewRequest("GET", upstreamURLStr, nil)
 	if err != nil {
-		log.Printf("SegmentProxy: Error creating request for upstream segment %s: %v", upstreamURLStr, err)
+		log.Printf("SegmentProxyHandler: Error creating request for upstream segment %s: %v", upstreamURLStr, err)
 		http.Error(w, "Failed to create upstream request", http.StatusInternalServerError)
 		return
 	}
 	if channelCfg.UserAgent != "" {
 		req.Header.Set("User-Agent", channelCfg.UserAgent)
 	}
+	log.Printf("SegmentProxyHandler: Requesting upstream segment: %s with User-Agent: '%s'", upstreamURLStr, req.Header.Get("User-Agent"))
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		log.Printf("SegmentProxy: Error fetching upstream segment %s: %v", upstreamURLStr, err)
+		log.Printf("SegmentProxyHandler: Error fetching upstream segment %s: %v", upstreamURLStr, err)
 		http.Error(w, "Failed to fetch upstream segment", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("SegmentProxy: Upstream segment fetch for %s returned status %s", upstreamURLStr, resp.Status)
 		w.WriteHeader(resp.StatusCode)
+		// Try to copy a small part of the body if it's an error, for debugging
 		if resp.ContentLength > 0 && resp.ContentLength < 1024 {
-			io.CopyN(w, resp.Body, resp.ContentLength)
+			bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+			w.Write(bodyBytes)
+		} else if resp.ContentLength == 0 {
+			fmt.Fprintf(w, "Error fetching upstream segment: %s (empty body)", resp.Status)
 		} else {
+			// For larger or unknown content length, just write status
 			fmt.Fprintf(w, "Error fetching upstream segment: %s", resp.Status)
 		}
 		return
 	}
 
+	// Copy relevant headers from upstream to client
 	for key, values := range resp.Header {
 		for _, value := range values {
-			if key == "Content-Type" || key == "Content-Length" || key == "ETag" || key == "Last-Modified" || key == "Cache-Control" || key == "Expires" {
+			// Only copy a curated list of headers. Avoids issues with Hop-by-hop headers etc.
+			if key == "Content-Type" || key == "Content-Length" || key == "ETag" || key == "Last-Modified" || key == "Cache-Control" || key == "Expires" || key == "Date" {
 				w.Header().Add(key, value)
 			}
 		}
 	}
+	// Ensure Content-Type is set, default to octet-stream if not provided by upstream.
 	if w.Header().Get("Content-Type") == "" {
+		log.Printf("SegmentProxyHandler: Upstream response for %s missing Content-Type. Defaulting to application/octet-stream.", upstreamURLStr)
 		w.Header().Set("Content-Type", "application/octet-stream")
 	}
 
 	w.WriteHeader(http.StatusOK)
-	if _, err := io.Copy(w, resp.Body); err != nil {
-		log.Printf("SegmentProxy: Error copying segment data for %s to client: %v", upstreamURLStr, err)
+	copiedBytes, err := io.Copy(w, resp.Body)
+	if err != nil {
+		log.Printf("SegmentProxyHandler: Error copying segment data for %s to client: %v. Copied %d bytes.", upstreamURLStr, err, copiedBytes)
+	} else {
+		log.Printf("SegmentProxyHandler: Successfully copied %d bytes for segment %s to client.", copiedBytes, upstreamURLStr)
 	}
 }
 
 // keyServerHandler serves decryption keys for a specific channel.
 func (appCtx *AppContext) keyServerHandler(w http.ResponseWriter, r *http.Request, channelCfg *config.ChannelConfig) {
-	log.Printf("KEY server request for channel %s (%s)", channelCfg.Name, channelCfg.ID)
+	log.Printf("KeyServerHandler: START - Request for channel %s (%s), URL=%s", channelCfg.Name, channelCfg.ID, r.URL.String())
+	defer log.Printf("KeyServerHandler: END - Request for channel %s (%s), URL=%s", channelCfg.Name, channelCfg.ID, r.URL.String())
 
 	if len(channelCfg.ParsedKey) == 0 {
-		log.Printf("No key configured for channel %s (%s)", channelCfg.Name, channelCfg.ID)
+		log.Printf("KeyServerHandler: No key configured for channel %s (%s)", channelCfg.Name, channelCfg.ID)
 		http.NotFound(w, r)
 		return
 	}
 
-	log.Printf("Serving key for channel %s (%s). Key length: %d bytes",
-		channelCfg.Name, channelCfg.ID, len(channelCfg.ParsedKey))
+	log.Printf("KeyServerHandler: Serving key for channel %s (%s). Key length: %d bytes. ParsedKey (first 4 bytes if available): %x",
+		channelCfg.Name, channelCfg.ID, len(channelCfg.ParsedKey), channelCfg.ParsedKey[:min(4, len(channelCfg.ParsedKey))])
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Write(channelCfg.ParsedKey)
+	w.Header().Set("Content-Length", strconv.Itoa(len(channelCfg.ParsedKey)))
+	_, err := w.Write(channelCfg.ParsedKey)
+	if err != nil {
+		log.Printf("KeyServerHandler: Error writing key for channel %s (%s): %v", channelCfg.Name, channelCfg.ID, err)
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

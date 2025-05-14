@@ -12,11 +12,21 @@ import (
 
 func main() {
 	// Define command-line flags
-	configFile := flag.String("config", "channels.json", "Path to the configuration file")
-	listenAddr := flag.String("listen", ":8080", "Address and port to listen on (e.g., :8080 or 127.0.0.1:8080)")
+	defaultConfigFile := "channels.json"
+	defaultListenAddr := ":8080"
+
+	configFile := flag.String("config", defaultConfigFile, "Path to the configuration file (can be overridden by D2H_CHANNELS_JSON_PATH env var)")
+	listenAddrFlag := flag.String("listen", defaultListenAddr, "Address and port to listen on (e.g., :8080 or 127.0.0.1:8080; can be overridden by D2H_LISTEN_ADDR env var)")
 	flag.Parse()
 
+	// Determine listen address: environment variable > command-line flag > default
+	listenAddr := os.Getenv("D2H_LISTEN_ADDR")
+	if listenAddr == "" {
+		listenAddr = *listenAddrFlag
+	}
+
 	// Attempt to load the configuration
+	// config.LoadConfig will use D2H_CHANNELS_JSON_PATH env var if set, otherwise *configFile
 	cfg, err := config.LoadConfig(*configFile)
 	if err != nil {
 		log.Fatalf("Error loading configuration from %s: %v", *configFile, err)
@@ -59,7 +69,7 @@ func main() {
 	router := handler.SetupRouter(appCtx)
 
 	server := &http.Server{
-		Addr:    *listenAddr,
+		Addr:    listenAddr, // Use the determined listenAddr
 		Handler: router,
 	}
 
