@@ -14,6 +14,37 @@ import (
 	"net/url" // Added for precomputed data
 )
 
+// Helper function to identify STPP tracks
+// IsSTPPTrack checks if the AdaptationSet represents an STPP subtitle track.
+func IsSTPPTrack(as *mpd.AdaptationSet) bool {
+	if as == nil {
+		return false
+	}
+	// Check MimeType for "application/mp4" and Codecs for "stpp"
+	// Also consider if ContentType is "text" and MimeType is "application/mp4" without specific codecs,
+	// but the primary indicator is codecs="stpp".
+	isMP4 := strings.Contains(as.MimeType, "application/mp4")
+	hasSTPPCodec := false
+	if len(as.Representations) > 0 { // Check codecs in representations
+		for _, rep := range as.Representations {
+			if strings.Contains(strings.ToLower(rep.Codecs), "stpp") {
+				hasSTPPCodec = true
+				break
+			}
+		}
+	}
+	// Fallback to checking AdaptationSet's codecs if not found in representations
+	// (Though typically codecs are on Representation)
+	// For simplicity, we'll assume codecs on Representation is sufficient for now.
+
+	// A more direct check if AdaptationSet itself has codecs (less common for subtitles)
+	// if !hasSTPPCodec && strings.Contains(strings.ToLower(as.Codecs), "stpp") {
+	// 	hasSTPPCodec = true
+	// }
+
+	return isMP4 && hasSTPPCodec
+}
+
 const numLiveSegments = 5 // Number of segments to keep in a live media playlist
 
 // PrecomputedSegmentData holds readily usable data for a specific stream/quality.
@@ -265,7 +296,7 @@ func precomputeMPDData(cachedEntry *CachedMPD) error {
 				streamTypeKey = "video"
 			} else if as.ContentType == "audio" || strings.Contains(as.MimeType, "audio") {
 				streamTypeKey = "audio"
-			} else if as.ContentType == "text" || strings.Contains(as.MimeType, "text") { // Add more subtitle mimetypes if necessary
+			} else if as.ContentType == "text" || strings.Contains(as.MimeType, "text") || strings.Contains(as.MimeType, "application/mp4") { // Add more subtitle mimetypes if necessary, include application/mp4 for STPP
 				streamTypeKey = "subtitles"
 			} else {
 				continue // Skip unknown content types
@@ -651,7 +682,11 @@ func generateMasterPlaylist(mpdData *mpd.MPD, channelID string) (string, error) 
 	subtitleStreamIndex := 0
 	for _, period := range mpdData.Periods {
 		for _, as := range period.AdaptationSets {
-			if as.ContentType == "text" || strings.Contains(as.MimeType, "text") || strings.Contains(as.MimeType, "application/ttml+xml") || strings.Contains(as.MimeType, "application/mp4; codecs=\"wvtt\"") {
+			// Adjusted condition to correctly identify subtitle tracks, including STPP
+			if as.ContentType == "text" ||
+				strings.Contains(as.MimeType, "text") ||
+				strings.Contains(as.MimeType, "application/ttml+xml") ||
+				(strings.Contains(as.MimeType, "application/mp4") && (strings.Contains(as.Representations[0].Codecs, "wvtt") || strings.Contains(as.Representations[0].Codecs, "stpp"))) {
 				if len(as.Representations) > 0 {
 					lang := as.Lang
 					if lang == "" {
@@ -680,14 +715,30 @@ func generateMasterPlaylist(mpdData *mpd.MPD, channelID string) (string, error) 
 	for _, period := range mpdData.Periods {
 		for _, as := range period.AdaptationSets {
 			if as.ContentType == "video" || strings.Contains(as.MimeType, "video") {
-				for _, rep := range as.Representations {
+				if len(as.Representations) == 0 {
+					continue
+				}
+
+				// Find the representation with the highest bandwidth in this AdaptationSet
+				var bestRep *mpd.Representation = nil
+				var maxBandwidth uint // Changed to uint to match rep.Bandwidth
+
+				for i := range as.Representations {
+					rep := &as.Representations[i] // Use pointer to avoid copying
+					if rep.Bandwidth > maxBandwidth {
+						maxBandwidth = rep.Bandwidth
+						bestRep = rep
+					}
+				}
+
+				if bestRep != nil {
+					rep := bestRep // Use the best representation found
 					var streamInf strings.Builder
 					streamInf.WriteString("#EXT-X-STREAM-INF:PROGRAM-ID=1") // PROGRAM-ID is optional but common
 
 					if rep.Bandwidth > 0 {
 						streamInf.WriteString(fmt.Sprintf(",BANDWIDTH=%d", rep.Bandwidth))
-						// AVERAGE-BANDWIDTH is optional, can be same as BANDWIDTH if not specified otherwise
-						streamInf.WriteString(fmt.Sprintf(",AVERAGE-BANDWIDTH=%d", rep.Bandwidth))
+						streamInf.WriteString(fmt.Sprintf(",AVERAGE-BANDWIDTH=%d", rep.Bandwidth)) // AVERAGE-BANDWIDTH is optional
 					}
 					if rep.Width > 0 && rep.Height > 0 {
 						streamInf.WriteString(fmt.Sprintf(",RESOLUTION=%dx%d", rep.Width, rep.Height))
@@ -739,7 +790,11 @@ func generateMediaPlaylists(mpdData *mpd.MPD, finalMPDURLStr string, channelID s
 				streamType = "video"
 			} else if as.ContentType == "audio" || strings.Contains(as.MimeType, "audio") {
 				streamType = "audio"
-			} else if as.ContentType == "text" || strings.Contains(as.MimeType, "text") || strings.Contains(as.MimeType, "application/ttml+xml") || strings.Contains(as.MimeType, "application/mp4; codecs=\"wvtt\"") {
+				// Adjusted condition to correctly identify subtitle tracks for media playlist generation
+			} else if as.ContentType == "text" ||
+				strings.Contains(as.MimeType, "text") ||
+				strings.Contains(as.MimeType, "application/ttml+xml") ||
+				(strings.Contains(as.MimeType, "application/mp4") && len(as.Representations) > 0 && (strings.Contains(as.Representations[0].Codecs, "wvtt") || strings.Contains(as.Representations[0].Codecs, "stpp"))) {
 				streamType = "subtitles"
 			} else {
 				continue // Skip unknown content types
@@ -815,11 +870,15 @@ func generateMediaPlaylists(mpdData *mpd.MPD, finalMPDURLStr string, channelID s
 						if segDurationSeconds > maxSegDurSeconds {
 							maxSegDurSeconds = segDurationSeconds
 						}
-						// HLS segment URL construction: /hls/<channelID>/<streamType>/<qualityOrLangKey>/<time_or_number>.m4s
+						// HLS segment URL construction: /hls/<channelID>/<streamType>/<qualityOrLangKey>/<time_or_number>.[m4s|vtt]
 						// The actual segment name for HLS is derived from its start time or a sequence number.
 						// Using start time for now as it's directly available.
 						segmentIdentifierForHLS := strconv.FormatUint(currentStartTime, 10)
-						hlsSegmentURL := fmt.Sprintf("/hls/%s/%s/%s/%s.m4s", channelID, streamType, qualityOrLangKey, segmentIdentifierForHLS)
+						segmentFileExtension := ".m4s"
+						if streamType == "subtitles" && IsSTPPTrack(&as) { // Check if it's an STPP track
+							segmentFileExtension = ".vtt"
+						}
+						hlsSegmentURL := fmt.Sprintf("/hls/%s/%s/%s/%s%s", channelID, streamType, qualityOrLangKey, segmentIdentifierForHLS, segmentFileExtension)
 
 						allSegments = append(allSegments, struct {
 							StartTime, Duration uint64
@@ -844,11 +903,18 @@ func generateMediaPlaylists(mpdData *mpd.MPD, finalMPDURLStr string, channelID s
 				playlistBuf.WriteString(fmt.Sprintf("#EXT-X-MEDIA-SEQUENCE:%d\n", hlsBaseMediaSequence))
 
 				// EXT-X-MAP (Initialization Segment)
-				if segTemplate.Initialization != "" {
-					// The HLS init segment URI will be proxied, so it needs a distinct name like "init.m4s"
-					hlsInitSegmentName := "init.m4s"
-					mapURI := fmt.Sprintf("/hls/%s/%s/%s/%s", channelID, streamType, qualityOrLangKey, hlsInitSegmentName)
-					playlistBuf.WriteString(fmt.Sprintf("#EXT-X-MAP:URI=\"%s\"\n", mapURI))
+				// Omit MAP for STPP->WebVTT converted tracks as WebVTT doesn't use MP4 init segments
+				if !(streamType == "subtitles" && IsSTPPTrack(&as)) {
+					if segTemplate.Initialization != "" {
+						// The HLS init segment URI will be proxied, so it needs a distinct name like "init.m4s"
+						// For STPP (non-converted) or other MP4 based subtitles, it might still be init.m4s
+						hlsInitSegmentName := "init.m4s"
+						// If we were to support STPP as .mp4 segments directly in HLS (not converting to VTT),
+						// this init segment name might need to be different or handled specifically.
+						// But since all STPP is converted to VTT, this branch is for non-STPP or non-subtitle tracks.
+						mapURI := fmt.Sprintf("/hls/%s/%s/%s/%s", channelID, streamType, qualityOrLangKey, hlsInitSegmentName)
+						playlistBuf.WriteString(fmt.Sprintf("#EXT-X-MAP:URI=\"%s\"\n", mapURI))
+					}
 				}
 
 				// EXT-X-KEY (Encryption)
@@ -903,7 +969,11 @@ func adaptaciónSetSubtitleIndex(mpdData *mpd.MPD, targetAs *mpd.AdaptationSet) 
 	idx := 0
 	for _, p := range mpdData.Periods {
 		for _, as := range p.AdaptationSets {
-			if as.ContentType == "text" || strings.Contains(as.MimeType, "text") || strings.Contains(as.MimeType, "application/ttml+xml") || strings.Contains(as.MimeType, "application/mp4; codecs=\"wvtt\"") {
+			// Adjusted condition to correctly identify subtitle tracks for indexing
+			if as.ContentType == "text" ||
+				strings.Contains(as.MimeType, "text") ||
+				strings.Contains(as.MimeType, "application/ttml+xml") ||
+				(strings.Contains(as.MimeType, "application/mp4") && (strings.Contains(as.Representations[0].Codecs, "wvtt") || strings.Contains(as.Representations[0].Codecs, "stpp"))) {
 				if &as == targetAs { // Compare pointers
 					return idx
 				}

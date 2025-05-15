@@ -8,9 +8,16 @@ import (
 	"strconv"
 	"strings"
 
+	"bytes"
 	"dash2hlsproxy/internal/config"
 	"dash2hlsproxy/internal/mpd_manager"
+	"errors" // For custom error
+
+	"github.com/abema/go-mp4" // Replaced Eyevinn/mp4ff
+	"github.com/asticode/go-astisub"
 )
+
+var errMdatFoundAndProcessed = errors.New("mdat box found and processed, stop iteration")
 
 // AppContext holds dependencies for handlers, like the app configuration.
 type AppContext struct {
@@ -170,14 +177,7 @@ func (appCtx *AppContext) mediaPlaylistHandler(w http.ResponseWriter, r *http.Re
 }
 
 func (appCtx *AppContext) segmentProxyHandler(w http.ResponseWriter, r *http.Request, channelCfg *config.ChannelConfig, streamType string, qualityOrLang string, segmentName string) {
-	// log.Printf("SegmentProxyHandler: START - Request for channel %s (%s): type=%s, quality/lang=%s, segment=%s, URL=%s", // Removed success log
-	//	channelCfg.Name, channelCfg.ID, streamType, qualityOrLang, segmentName, r.URL.String())
-	// defer log.Printf("SegmentProxyHandler: END - Request for channel %s (%s): type=%s, quality/lang=%s, segment=%s, URL=%s", // Removed success log
-	//	channelCfg.Name, channelCfg.ID, streamType, qualityOrLang, segmentName, r.URL.String())
-
-	// Ensure MPD is up-to-date. GetMPD also handles precomputation and playlist generation.
-	// We don't directly use the returned mpdData here for segment lookup anymore,
-	// but calling it ensures the cachedEntry used below is fresh.
+	// Ensure MPD is up-to-date.
 	_, _, err := appCtx.MPDManager.GetMPD(channelCfg)
 	if err != nil {
 		log.Printf("SegmentProxy: Error ensuring MPD is up-to-date for channel %s (%s): %v", channelCfg.Name, channelCfg.ID, err)
@@ -187,12 +187,12 @@ func (appCtx *AppContext) segmentProxyHandler(w http.ResponseWriter, r *http.Req
 
 	cachedEntry, exists := appCtx.MPDManager.GetCachedEntry(channelCfg.ID)
 	if !exists {
-		log.Printf("SegmentProxy: Cached entry not found for channel %s (%s) after GetMPD call. This should not happen.", channelCfg.Name, channelCfg.ID)
+		log.Printf("SegmentProxy: Cached entry not found for channel %s (%s) after GetMPD call.", channelCfg.Name, channelCfg.ID)
 		http.Error(w, "MPD data not available", http.StatusInternalServerError)
 		return
 	}
 
-	cachedEntry.Mux.RLock() // Lock for reading PrecomputedData
+	cachedEntry.Mux.RLock()
 	streamMap, streamOk := cachedEntry.PrecomputedData[streamType]
 	if !streamOk {
 		cachedEntry.Mux.RUnlock()
@@ -200,22 +200,20 @@ func (appCtx *AppContext) segmentProxyHandler(w http.ResponseWriter, r *http.Req
 		http.NotFound(w, r)
 		return
 	}
-
 	precomputed, qualityOk := streamMap[qualityOrLang]
+	cachedEntry.Mux.RUnlock() // Unlock earlier as we copied necessary data or determined not found
+
 	if !qualityOk {
-		cachedEntry.Mux.RUnlock()
 		log.Printf("SegmentProxy: Precomputed data for streamType '%s', quality/lang '%s' not found. Channel %s (%s)", streamType, qualityOrLang, channelCfg.Name, channelCfg.ID)
 		http.NotFound(w, r)
 		return
 	}
-	// Make copies of necessary fields from precomputed data while under lock
-	resolvedSegmentBaseURL := precomputed.ResolvedBaseURL
-	segTemplate := precomputed.SegmentTemplate // This is a pointer, but its content is static per MPD version
-	representationID := precomputed.RepresentationID
-	// targetAS and targetRep could also be copied if needed for other logic, but not for URL construction here.
-	cachedEntry.Mux.RUnlock()
 
-	if segTemplate == nil { // Should have been caught during precomputation, but double check
+	resolvedSegmentBaseURL := precomputed.ResolvedBaseURL
+	segTemplate := precomputed.SegmentTemplate
+	representationID := precomputed.RepresentationID
+
+	if segTemplate == nil {
 		log.Printf("SegmentProxy: SegmentTemplate missing in precomputed data for %s/%s in channel %s (%s)",
 			streamType, qualityOrLang, channelCfg.Name, channelCfg.ID)
 		http.Error(w, "Invalid MPD data (no SegmentTemplate in precomputed data)", http.StatusInternalServerError)
@@ -223,104 +221,224 @@ func (appCtx *AppContext) segmentProxyHandler(w http.ResponseWriter, r *http.Req
 	}
 
 	var relativeSegmentPath string
-	hlsSegmentIdentifier := strings.TrimSuffix(segmentName, ".m4s")
+	hlsSegmentIdentifier := ""
+	isVTTRequest := false
+	originalSegmentNameForMPD := segmentName // Keep original for MPD path construction if it was .vtt
 
-	if hlsSegmentIdentifier == "init" {
+	if streamType == "subtitles" && strings.HasSuffix(segmentName, ".vtt") {
+		isVTTRequest = true
+		hlsSegmentIdentifier = strings.TrimSuffix(segmentName, ".vtt")
+		// Construct the original .m4s segment name for MPD path resolution
+		originalSegmentNameForMPD = hlsSegmentIdentifier + ".m4s"
+	} else {
+		hlsSegmentIdentifier = strings.TrimSuffix(segmentName, ".m4s")
+	}
+
+	// Determine relative path using originalSegmentNameForMPD for MPD template substitution
+	// if it was a .vtt request, because MPD templates expect .m4s (or whatever is in the template)
+	mpdPathSegmentIdentifier := strings.TrimSuffix(originalSegmentNameForMPD, ".m4s") // Ensure we use the m4s identifier for MPD templates
+
+	if mpdPathSegmentIdentifier == "init" {
+		if isVTTRequest { // VTT init requests are not standard
+			log.Printf("SegmentProxyHandler: Received init segment request for WebVTT ('%s'). Returning 404.", segmentName)
+			http.NotFound(w, r)
+			return
+		}
 		if segTemplate.Initialization == "" {
-			log.Printf("SegmentProxyHandler: HLS requested 'init.m4s' but MPD (precomputed) has no Initialization segment for %s/%s, channel %s (%s)",
-				streamType, qualityOrLang, channelCfg.Name, channelCfg.ID)
+			log.Printf("SegmentProxyHandler: HLS requested 'init.m4s' but MPD has no Initialization for %s/%s", streamType, qualityOrLang)
 			http.Error(w, "MPD has no Initialization segment", http.StatusNotFound)
 			return
 		}
 		relativeSegmentPath = strings.ReplaceAll(segTemplate.Initialization, "$RepresentationID$", representationID)
 	} else {
 		if segTemplate.Media == "" {
-			log.Printf("SegmentProxyHandler: HLS requested media segment '%s' but MPD (precomputed) has no Media template for %s/%s, channel %s (%s)",
-				segmentName, streamType, qualityOrLang, channelCfg.Name, channelCfg.ID)
+			log.Printf("SegmentProxyHandler: MPD has no Media template for %s/%s", streamType, qualityOrLang)
 			http.Error(w, "MPD has no Media segment template", http.StatusNotFound)
 			return
 		}
 		tempPath := strings.ReplaceAll(segTemplate.Media, "$RepresentationID$", representationID)
-
 		if strings.Contains(tempPath, "$Time$") {
-			relativeSegmentPath = strings.ReplaceAll(tempPath, "$Time$", hlsSegmentIdentifier)
+			relativeSegmentPath = strings.ReplaceAll(tempPath, "$Time$", mpdPathSegmentIdentifier)
 		} else if strings.Contains(tempPath, "$Number$") {
-			relativeSegmentPath = strings.ReplaceAll(tempPath, "$Number$", hlsSegmentIdentifier)
+			relativeSegmentPath = strings.ReplaceAll(tempPath, "$Number$", mpdPathSegmentIdentifier)
 		} else {
-			log.Printf("SegmentProxyHandler: Warning - MPD Media template '%s' (precomputed) for %s/%s does not contain $Time$ or $Number$. Using HLS identifier '%s' directly. Path: '%s'",
-				segTemplate.Media, streamType, qualityOrLang, hlsSegmentIdentifier, tempPath)
-			relativeSegmentPath = tempPath
+			log.Printf("SegmentProxyHandler: Warning - MPD Media template for %s/%s does not contain $Time$ or $Number$. Using '%s' directly.",
+				streamType, qualityOrLang, mpdPathSegmentIdentifier)
+			relativeSegmentPath = tempPath // Or handle as an error
 		}
 	}
 
 	if relativeSegmentPath == "" {
-		log.Printf("SegmentProxyHandler: Failed to determine relativeSegmentPath for HLS segment '%s', channel %s (%s) using precomputed data", segmentName, channelCfg.Name, channelCfg.ID)
+		log.Printf("SegmentProxyHandler: Failed to determine relativeSegmentPath for HLS segment '%s'", segmentName)
 		http.Error(w, "Could not determine upstream segment path", http.StatusInternalServerError)
 		return
 	}
 
-	upstreamURLStr := resolvedSegmentBaseURL + relativeSegmentPath
-	// log.Printf("SegmentProxyHandler: ---> Key URL Components (precomputed) for channel %s (%s): ResolvedSegmentBaseURL='%s', RelativeSegmentPath='%s', ConstructedUpstreamURLToFetch='%s'",
-	//	channelCfg.Name, channelCfg.ID, resolvedSegmentBaseURL, relativeSegmentPath, upstreamURLStr)
-	// log.Printf("SegmentProxyHandler: ---> Key URL Components for channel %s (%s): FinalMPDURL='%s', ResolvedSegmentBaseURL (before adding trailing slash)='%s', RelativeSegmentPath (from MPD template)='%s', ConstructedUpstreamURLToFetch='%s'", // Removed detailed success log
-	//	channelCfg.Name, channelCfg.ID, finalMPDURLStr, strings.TrimSuffix(resolvedSegmentBaseURL, "/"), relativeSegmentPath, upstreamURLStr)
+	// Log components of the upstream URL - REMOVED as per user request
+	/*
+		log.Printf("SegmentProxyHandler: Building upstream URL. ResolvedBaseURL: '%s', RelativeSegmentPath: '%s', SegmentTemplate Media: '%s', SegmentTemplate Init: '%s', RepresentationID: '%s', HLS SegmentName: '%s'",
+			resolvedSegmentBaseURL,
+			relativeSegmentPath,
+			safeString(segTemplate.Media),
+			safeString(segTemplate.Initialization),
+			representationID,
+			segmentName)
+	*/
 
-	// Use the shared HTTP client from AppContext
-	req, err := http.NewRequest("GET", upstreamURLStr, nil)
+	upstreamURLStr := resolvedSegmentBaseURL + relativeSegmentPath
+
+	httpClientReq, err := http.NewRequest("GET", upstreamURLStr, nil)
 	if err != nil {
 		log.Printf("SegmentProxyHandler: Error creating request for upstream segment %s: %v", upstreamURLStr, err)
 		http.Error(w, "Failed to create upstream request", http.StatusInternalServerError)
 		return
 	}
 	if channelCfg.UserAgent != "" {
-		req.Header.Set("User-Agent", channelCfg.UserAgent)
+		httpClientReq.Header.Set("User-Agent", channelCfg.UserAgent)
 	}
-	// log.Printf("SegmentProxyHandler: Requesting upstream segment: %s with User-Agent: '%s'", upstreamURLStr, req.Header.Get("User-Agent")) // Removed success log
 
-	resp, err := appCtx.HTTPClient.Do(req) // Use shared client
+	upstreamResp, err := appCtx.HTTPClient.Do(httpClientReq)
 	if err != nil {
 		log.Printf("SegmentProxyHandler: Error fetching upstream segment %s: %v", upstreamURLStr, err)
 		http.Error(w, "Failed to fetch upstream segment", http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
+	defer upstreamResp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		w.WriteHeader(resp.StatusCode)
-		// Try to copy a small part of the body if it's an error, for debugging
-		if resp.ContentLength > 0 && resp.ContentLength < 1024 {
-			bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-			w.Write(bodyBytes)
-		} else if resp.ContentLength == 0 {
-			fmt.Fprintf(w, "Error fetching upstream segment: %s (empty body)", resp.Status)
-		} else {
-			// For larger or unknown content length, just write status
-			fmt.Fprintf(w, "Error fetching upstream segment: %s", resp.Status)
-		}
+	if upstreamResp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(io.LimitReader(upstreamResp.Body, 1024))
+		log.Printf("SegmentProxyHandler: Upstream segment fetch for %s failed with status %s. Body: %s", upstreamURLStr, upstreamResp.Status, string(bodyBytes))
+		http.Error(w, fmt.Sprintf("Failed to fetch upstream segment: %s", upstreamResp.Status), upstreamResp.StatusCode)
 		return
 	}
 
-	// Copy relevant headers from upstream to client
-	for key, values := range resp.Header {
+	if isVTTRequest && precomputed.AdaptationSet != nil && mpd_manager.IsSTPPTrack(precomputed.AdaptationSet) {
+		stppData, err := io.ReadAll(upstreamResp.Body)
+		if err != nil {
+			log.Printf("SegmentProxyHandler: Error reading STPP segment body from %s: %v", upstreamURLStr, err)
+			http.Error(w, "Failed to read STPP segment data", http.StatusInternalServerError)
+			return
+		}
+		upstreamResp.Body.Close() // Close original body as we've read it
+
+		var ttmlPayload []byte = stppData       // Default to full data if MP4 parsing fails
+		ttmlReader := bytes.NewReader(stppData) // Initialize ttmlReader with stppData, will be updated if mdat is found
+
+		stppDataReader := bytes.NewReader(stppData)
+		var mdatFound bool
+		var mdatErr error
+
+		// Use abema/go-mp4 to find and extract MDAT payload
+		_, errReadBox := mp4.ReadBoxStructure(stppDataReader, func(h *mp4.ReadHandle) (interface{}, error) {
+			if h.BoxInfo.Type.String() == "mdat" {
+				box, _, err := h.ReadPayload()
+				if err != nil {
+					mdatErr = fmt.Errorf("reading mdat payload: %w", err)
+					return nil, errMdatFoundAndProcessed // Stop on error, but signal it was due to finding mdat
+				}
+				if mdat, ok := box.(*mp4.Mdat); ok {
+					// Create a copy of the data, as the underlying buffer of Mdat might be from a larger mapped file or buffer.
+					// For stppData from io.ReadAll, this might not be strictly necessary but is safer.
+					ttmlPayload = make([]byte, len(mdat.Data))
+					copy(ttmlPayload, mdat.Data)
+					ttmlReader = bytes.NewReader(ttmlPayload)
+					mdatFound = true
+					// log.Printf("SegmentProxyHandler: Extracted TTML from MDAT box for %s using abema/go-mp4", segmentName) // REMOVED as per user request
+				} else {
+					mdatErr = fmt.Errorf("mdat payload is not of type *mp4.Mdat, actual type: %T", box)
+				}
+				return nil, errMdatFoundAndProcessed // Stop after processing the first mdat
+			}
+			// We are looking for a top-level mdat, typically after a moof in an fMP4 segment.
+			// We don't need to expand children of other boxes for this specific task.
+			// However, ReadBoxStructure by default does a depth-first traversal if h.Expand() is called.
+			// To only check top-level boxes in a simple fMP4 segment (like moof, mdat):
+			if len(h.Path) > 1 { // Path includes the current box, so > 1 means it's a child
+				return nil, nil // Don't expand children
+			}
+			return h.Expand() // Expand top-level boxes
+		})
+
+		if errReadBox != nil && errReadBox != errMdatFoundAndProcessed {
+			log.Printf("SegmentProxyHandler: Error reading STPP MP4 structure for %s with abema/go-mp4: %v", segmentName, errReadBox)
+			// Fallback: ttmlPayload and ttmlReader remain as original stppData
+		} else if mdatErr != nil {
+			log.Printf("SegmentProxyHandler: Error processing MDAT for %s with abema/go-mp4: %v", segmentName, mdatErr)
+			// Fallback
+		} else if !mdatFound {
+			log.Printf("SegmentProxyHandler: MDAT box not found in STPP segment for %s using abema/go-mp4. Proceeding with raw data.", segmentName)
+			// Fallback
+		}
+
+		// Log details about the extracted TTML payload before parsing - REMOVED as per user request
+		/*
+			ttmlPayloadLength := len(ttmlPayload)
+			// Log the full TTML payload as requested by the user for debugging astisub
+			log.Printf("SegmentProxyHandler: Extracted TTML payload for %s. Length: %d bytes. Full Content:\n%s", segmentName, ttmlPayloadLength, string(ttmlPayload))
+		*/
+
+		subs, err := astisub.ReadFromTTML(ttmlReader)
+		if err != nil {
+			log.Printf("SegmentProxyHandler: Error parsing TTML data for segment %s (URL: %s): %v", segmentName, upstreamURLStr, err)
+			dataSnippet := string(ttmlPayload)
+			if len(dataSnippet) > 200 {
+				dataSnippet = dataSnippet[:200]
+			}
+			log.Printf("SegmentProxyHandler: TTML data snippet: %s", dataSnippet)
+			http.Error(w, "Failed to parse TTML data from STPP segment", http.StatusInternalServerError)
+			return
+		}
+
+		var webvttBuffer bytes.Buffer
+		if len(subs.Items) == 0 {
+			log.Printf("SegmentProxyHandler: No subtitle items found in TTML for segment %s after parsing (URL: %s). Sending empty WebVTT.", segmentName, upstreamURLStr)
+			// Send an empty but valid WebVTT response
+			emptyWebVTT := "WEBVTT\n\n"
+			w.Header().Set("Content-Type", "text/vtt")
+			w.Header().Set("Content-Length", strconv.Itoa(len(emptyWebVTT))) // Correctly set Content-Length
+			w.WriteHeader(http.StatusOK)
+			_, writeErr := w.Write([]byte(emptyWebVTT))
+			if writeErr != nil {
+				log.Printf("SegmentProxyHandler: Error writing empty WebVTT data for %s to client: %v", segmentName, writeErr)
+			}
+			return // Handled empty subtitles
+		}
+
+		if err := subs.WriteToWebVTT(&webvttBuffer); err != nil {
+			// This path should ideally not be hit if subs.Items is empty due to the check above,
+			// but astisub might have other reasons to fail WriteToWebVTT.
+			log.Printf("SegmentProxyHandler: Error converting TTML to WebVTT for segment %s (URL: %s): %v. Parsed %d items.", segmentName, upstreamURLStr, err, len(subs.Items))
+			http.Error(w, "Failed to convert TTML to WebVTT", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/vtt")
+		w.Header().Set("Content-Length", strconv.Itoa(webvttBuffer.Len()))
+		w.WriteHeader(http.StatusOK)
+		_, err = w.Write(webvttBuffer.Bytes())
+		if err != nil {
+			log.Printf("SegmentProxyHandler: Error writing WebVTT data for %s to client: %v", segmentName, err)
+		}
+		return // Conversion done
+	}
+
+	// Standard proxying for non-converted segments
+	for key, values := range upstreamResp.Header {
 		for _, value := range values {
-			// Only copy a curated list of headers. Avoids issues with Hop-by-hop headers etc.
 			if key == "Content-Type" || key == "Content-Length" || key == "ETag" || key == "Last-Modified" || key == "Cache-Control" || key == "Expires" || key == "Date" {
 				w.Header().Add(key, value)
 			}
 		}
 	}
-	// Ensure Content-Type is set, default to octet-stream if not provided by upstream.
 	if w.Header().Get("Content-Type") == "" {
 		log.Printf("SegmentProxyHandler: Upstream response for %s missing Content-Type. Defaulting to application/octet-stream.", upstreamURLStr)
 		w.Header().Set("Content-Type", "application/octet-stream")
 	}
 
 	w.WriteHeader(http.StatusOK)
-	copiedBytes, err := io.Copy(w, resp.Body)
+	_, err = io.Copy(w, upstreamResp.Body)
 	if err != nil {
-		log.Printf("SegmentProxyHandler: Error copying segment data for %s to client: %v. Copied %d bytes.", upstreamURLStr, err, copiedBytes)
-	} else {
-		// log.Printf("SegmentProxyHandler: Successfully copied %d bytes for segment %s to client.", copiedBytes, upstreamURLStr) // Removed success log
+		log.Printf("SegmentProxyHandler: Error copying segment data for %s to client: %v", upstreamURLStr, err)
 	}
 }
 
@@ -351,3 +469,11 @@ func (appCtx *AppContext) keyServerHandler(w http.ResponseWriter, r *http.Reques
 	}
 	return b
 }*/
+
+// Helper function to safely get string value from SegmentTemplate fields
+func safeString(s string) string {
+	if s == "" {
+		return "<empty_or_nil>"
+	}
+	return s
+}
