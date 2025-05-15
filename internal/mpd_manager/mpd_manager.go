@@ -414,14 +414,20 @@ func (m *MPDManager) autoUpdateMPD(channelCfg *config.ChannelConfig, cachedEntry
 			isInitialBaseURLSet = cachedEntry.InitialBaseURLIsSet
 			cachedEntry.Mux.RUnlock()
 
-			inactivityTimeout := 2 * initialMinUpdatePeriod // Use initialMinUpdatePeriod for consistent timeout
-			if inactivityTimeout <= 0 {
-				inactivityTimeout = 10 * time.Minute // Default fallback
+			// Stop auto-update if channel is inactive for 5 times the initial minimum update period.
+			inactivityTimeout := 5 * initialMinUpdatePeriod
+			if inactivityTimeout <= 0 { // Safety fallback, as initialMinUpdatePeriod should be > 0 when autoUpdateMPD is called
+				inactivityTimeout = 5 * 10 * time.Minute // e.g., 50 minutes if MUP was unexpectedly zero or negative
 			}
 
 			if time.Since(lastAccessed) > inactivityTimeout {
-				// log.Printf("AutoUpdater [%s]: Channel not accessed for over %s (last_accessed: %s, initial_mup: %s). Stopping auto-update.", // Informational, but can be verbose
-				//	channelCfg.ID, inactivityTimeout, lastAccessed.Format(time.RFC3339), initialMinUpdatePeriod)
+				log.Printf("AutoUpdater [%s]: Channel inactive for over %s (last access: %s, 5x initial MUP: %s). Stopping auto-updater and clearing cache.",
+					channelCfg.ID, inactivityTimeout, lastAccessed.Format(time.RFC3339), initialMinUpdatePeriod)
+
+				m.CacheLock.Lock()
+				delete(m.MPDCache, channelCfg.ID)
+				m.CacheLock.Unlock()
+				log.Printf("AutoUpdater [%s]: Cache cleared due to inactivity.", channelCfg.ID)
 				return
 			}
 

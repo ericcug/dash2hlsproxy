@@ -27,8 +27,8 @@ docker build -t dash2hlsproxy-app .
 *   **端口映射**: 使用 `-p <host_port>:<container_port>` 将容器的端口映射到主机。程序默认在容器内监听 `:8080` 端口，可以通过 `D2H_LISTEN_ADDR` 环境变量修改。
 *   **频道配置文件**:
     *   将您的频道配置文件（例如 `mytv.json`）挂载到容器中，例如挂载到 `/app/config/channels.json`。
-    *   通过环境变量 `D2H_CHANNELS_JSON_PATH` 指定容器内频道配置文件的完整路径。
-*   **监听地址 (可选)**: 通过环境变量 `D2H_LISTEN_ADDR` 可以更改容器内程序监听的地址和端口 (例如 `0.0.0.0:8888` 或 `:8888`)。
+    *   通过环境变量 `CHANNELS_JSON` 指定容器内频道配置文件的完整路径。
+*   **监听地址 (可选)**: 通过环境变量 `LISTEN_ADDR` 可以更改容器内程序监听的地址和端口 (例如 `0.0.0.0:8888` 或 `:8888`)。
 
 **示例:**
 
@@ -38,8 +38,8 @@ docker build -t dash2hlsproxy-app .
 docker run -d \
   -p 8888:8888 \
   -v $(pwd)/sampledata/mytv.json:/app/config/mytv.json \
-  -e D2H_CHANNELS_JSON_PATH="/app/config/mytv.json" \
-  -e D2H_LISTEN_ADDR=":8888" \
+  -e CHANNELS_JSON="/app/config/mytv.json" \
+  -e LISTEN_ADDR=":8888" \
   --name my-dash2hlsproxy \
   dash2hlsproxy-app
 ```
