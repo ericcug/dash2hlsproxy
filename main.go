@@ -18,11 +18,11 @@ func main() {
 	defaultListenAddr := ":8080"
 
 	channelsFile := flag.String("c", defaultChannelsFile, "Path to the configuration file (can be overridden by CHANNELS_JSON env var)")
-	listenAddrFlag := flag.String("l", defaultListenAddr, "Address and port to listen on (e.g., :8080 or 127.0.0.1:8080; can be overridden by D2H_LISTEN_ADDR env var)")
+	listenAddrFlag := flag.String("l", defaultListenAddr, "Address and port to listen on (e.g., :8080 or 127.0.0.1:8080; can be overridden by LISTEN_ADDR env var)")
 	flag.Parse()
 
 	// Determine listen address: environment variable > command-line flag > default
-	listenAddr := os.Getenv("D2H_LISTEN_ADDR")
+	listenAddr := os.Getenv("LISTEN_ADDR")
 	if listenAddr == "" {
 		listenAddr = *listenAddrFlag
 	}
