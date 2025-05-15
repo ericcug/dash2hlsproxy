@@ -35,19 +35,19 @@ type AppConfig struct {
 // parses it, and preprocesses some fields (like keys and channel map).
 // The filePath can be overridden by the D2H_CHANNELS_JSON_PATH environment variable.
 func LoadConfig(defaultFilePath string) (*AppConfig, error) {
-	filePath := os.Getenv("D2H_CHANNELS_JSON_PATH")
+	filePath := os.Getenv("CHANNELS_JSON")
 	if filePath == "" {
 		filePath = defaultFilePath
 	}
 
 	data, err := os.ReadFile(filePath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read config file %s: %w", filePath, err)
+		return nil, fmt.Errorf("failed to read channels file %s: %w", filePath, err)
 	}
 
 	var cfg AppConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal config JSON from %s: %w", filePath, err)
+		return nil, fmt.Errorf("failed to unmarshal channels JSON from %s: %w", filePath, err)
 	}
 
 	cfg.ChannelMap = make(map[string]*ChannelConfig)
