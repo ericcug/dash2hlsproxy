@@ -13,8 +13,7 @@ type ChannelConfig struct {
 	ID       string `json:"Id"`
 	Manifest string `json:"Manifest"`
 	// 密钥的十六进制字符串
-	Key       string `json:"Key"`
-	UserAgent string `json:"UserAgent"`
+	Key string `json:"Key"`
 
 	// ParsedKey 存储原始密钥字节。
 	// 这是在加载配置后填充的。
@@ -23,9 +22,10 @@ type ChannelConfig struct {
 
 // AppConfig 保存整个应用程序的配置，包括所有频道。
 type AppConfig struct {
-	Name     string          `json:"Name"`
-	ID       string          `json:"Id"`
-	Channels []ChannelConfig `json:"Channels"`
+	Name      string          `json:"Name"`
+	ID        string          `json:"Id"`
+	Channels  []ChannelConfig `json:"Channels"`
+	UserAgent string          `json:"UserAgent"`
 
 	// ChannelMap 提供按频道 ID 快速查找频道的功能。
 	// 这是在加载配置后填充的。

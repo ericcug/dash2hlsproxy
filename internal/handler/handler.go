@@ -2,7 +2,6 @@ package handler
 
 import (
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -51,7 +50,7 @@ func (appCtx *AppContext) hlsRouter(w http.ResponseWriter, r *http.Request) {
 
 	switch numSubParts {
 	case 0:
-		appCtx.masterPlaylistHandler(w, r, channelCfg)
+		appCtx.masterPlaylistHandler(w, channelCfg)
 	case 1:
 		if parts[1] == "key" {
 			appCtx.keyServerHandler(w, r, channelCfg)
@@ -65,9 +64,9 @@ func (appCtx *AppContext) hlsRouter(w http.ResponseWriter, r *http.Request) {
 		fileName := parts[3]
 
 		if strings.HasSuffix(fileName, ".m3u8") {
-			appCtx.mediaPlaylistHandler(w, r, channelCfg, streamType, qualityOrLang)
+			appCtx.mediaPlaylistHandler(w, channelCfg, streamType, qualityOrLang)
 		} else {
-			appCtx.segmentProxyHandler(w, r, channelCfg, streamType, qualityOrLang, fileName)
+			appCtx.segmentProxyHandler(w, channelCfg, streamType, qualityOrLang, fileName)
 		}
 	default:
 		appCtx.Logger.Warn("Unhandled HLS path structure", "path", path, "parts", len(parts))
@@ -75,7 +74,7 @@ func (appCtx *AppContext) hlsRouter(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (appCtx *AppContext) masterPlaylistHandler(w http.ResponseWriter, r *http.Request, channelCfg *config.ChannelConfig) {
+func (appCtx *AppContext) masterPlaylistHandler(w http.ResponseWriter, channelCfg *config.ChannelConfig) {
 	// 确保 MPD 数据和缓存的播放列表是最新的
 	_, _, err := appCtx.MPDManager.GetMPD(channelCfg)
 	if err != nil {
@@ -93,16 +92,25 @@ func (appCtx *AppContext) masterPlaylistHandler(w http.ResponseWriter, r *http.R
 		return
 	}
 
+	cachedEntry.Mux.Lock()
+	cachedEntry.LastAccessedAt = time.Now()
+	cachedEntry.Mux.Unlock()
+
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 	// 锁定以读取 MasterPlaylist
 	cachedEntry.Mux.RLock()
-	fmt.Fprint(w, cachedEntry.MasterPlaylist)
+	playlistContent := cachedEntry.MasterPlaylist
 	cachedEntry.Mux.RUnlock()
+
+	fmt.Fprint(w, playlistContent)
+
+	appCtx.Logger.Info("Successfully served master playlist",
+		"channel_name", channelCfg.Name,
+		"channel_id", channelCfg.ID,
+		"playlist_length", len(playlistContent))
 }
 
-const NumLiveSegments = 5
-
-func (appCtx *AppContext) mediaPlaylistHandler(w http.ResponseWriter, r *http.Request, channelCfg *config.ChannelConfig, streamType string, qualityOrLang string) {
+func (appCtx *AppContext) mediaPlaylistHandler(w http.ResponseWriter, channelCfg *config.ChannelConfig, streamType string, qualityOrLang string) {
 	// 确保 MPD 数据和缓存的播放列表是最新的
 	_, _, err := appCtx.MPDManager.GetMPD(channelCfg)
 	if err != nil {
@@ -118,6 +126,10 @@ func (appCtx *AppContext) mediaPlaylistHandler(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	cachedEntry.Mux.Lock()
+	cachedEntry.LastAccessedAt = time.Now()
+	cachedEntry.Mux.Unlock()
+
 	mediaPlaylistKey := fmt.Sprintf("%s/%s", streamType, qualityOrLang)
 
 	cachedEntry.Mux.RLock()
@@ -125,193 +137,76 @@ func (appCtx *AppContext) mediaPlaylistHandler(w http.ResponseWriter, r *http.Re
 	cachedEntry.Mux.RUnlock()
 
 	if !ok || playlistStr == "" {
-		appCtx.Logger.Error("Media playlist not found in cache for key",
-			"key", mediaPlaylistKey,
-			"stream_type", streamType,
-			"quality_or_lang", qualityOrLang,
-			"channel_name", channelCfg.Name,
-			"channel_id", channelCfg.ID)
+		appCtx.Logger.Error("Media playlist not found in cache for key", "key", mediaPlaylistKey)
 		http.Error(w, "Requested media playlist not available", http.StatusNotFound)
 		return
 	}
+
+	// --- 新增逻辑：等待分片缓存 ---
+	var requiredSegments []string
+	for _, line := range strings.Split(playlistStr, "\n") {
+		if strings.HasPrefix(line, "/hls/") {
+			requiredSegments = append(requiredSegments, line)
+		}
+	}
+
+	if len(requiredSegments) > 0 {
+		// 设置一个合理的超时时间，例如10秒
+		timeout := 10 * time.Second
+		err := appCtx.MPDManager.WaitForSegments(channelCfg.ID, requiredSegments, timeout)
+		if err != nil {
+			appCtx.Logger.Error("Error waiting for segments to be cached",
+				"key", mediaPlaylistKey,
+				"channel_id", channelCfg.ID,
+				"error", err)
+			http.Error(w, "Failed to cache segments in time", http.StatusInternalServerError)
+			return
+		}
+	}
+	// --- 结束新增逻辑 ---
 
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 	fmt.Fprint(w, playlistStr)
 }
 
-func (appCtx *AppContext) segmentProxyHandler(w http.ResponseWriter, r *http.Request, channelCfg *config.ChannelConfig, streamType string, qualityOrLang string, segmentName string) {
-	// 确保 MPD 是最新的，这对于获取最新的 SegmentCache 至关重要
-	_, _, err := appCtx.MPDManager.GetMPD(channelCfg)
-	if err != nil {
-		appCtx.Logger.Error("Failed to get MPD for segment proxy", "channel_name", channelCfg.Name, "channel_id", channelCfg.ID, "error", err)
-		http.Error(w, "Failed to process MPD for segment proxy", http.StatusInternalServerError)
-		return
-	}
-
+func (appCtx *AppContext) segmentProxyHandler(w http.ResponseWriter, channelCfg *config.ChannelConfig, streamType string, qualityOrLang string, segmentName string) {
 	cachedEntry, exists := appCtx.MPDManager.GetCachedEntry(channelCfg.ID)
 	if !exists || cachedEntry.SegmentCache == nil {
-		appCtx.Logger.Error("Cached entry or SegmentCache not found for segment proxy", "channel_name", channelCfg.Name, "channel_id", channelCfg.ID)
-		http.Error(w, "MPD data not available", http.StatusInternalServerError)
+		appCtx.Logger.Error("Cached entry or SegmentCache not found for segment proxy", "channel_id", channelCfg.ID)
+		http.Error(w, "Channel data not available", http.StatusInternalServerError)
 		return
 	}
 
-	// 构造用于 HLS URL 的分段路径，它将作为缓存键
 	segmentKey := fmt.Sprintf("/hls/%s/%s/%s/%s", channelCfg.ID, streamType, qualityOrLang, segmentName)
 
-	// 1. 检查缓存
-	cachedEntry.SegmentCache.RLock()
-	cachedSeg, segmentExists := cachedEntry.SegmentCache.Segments[segmentKey]
-	cachedEntry.SegmentCache.RUnlock()
-
-	if segmentExists {
-		appCtx.Logger.Debug("Serving segment from cache", "key", segmentKey)
-		w.Header().Set("Content-Type", cachedSeg.ContentType)
-		w.Header().Set("Content-Length", strconv.Itoa(len(cachedSeg.Data)))
-		w.Header().Set("X-Cache-Status", "HIT")
-		w.WriteHeader(http.StatusOK)
-		_, err := w.Write(cachedSeg.Data)
-		if err != nil {
-			if strings.Contains(err.Error(), "broken pipe") {
-				appCtx.Logger.Info("Client disconnected while serving cached segment", "key", segmentKey, "error", err)
-			} else {
-				appCtx.Logger.Error("Error writing cached segment to client", "key", segmentKey, "error", err)
-			}
-		}
+	// 在新设计中，如果分片不在缓存中，这是一个严重错误，因为 mediaPlaylistHandler 应该已经确保了它的存在。
+	cachedSeg, segmentExists := cachedEntry.SegmentCache.Get(segmentKey)
+	if !segmentExists {
+		appCtx.Logger.Error("FATAL: Segment not found in cache. This should not happen in the new design.",
+			"key", segmentKey,
+			"channel_id", channelCfg.ID)
+		w.Header().Set("X-Cache-Status", "MISS")
+		http.Error(w, "Segment not available", http.StatusInternalServerError)
 		return
 	}
 
-	// 2. 缓存未命中：从上游代理并回填缓存
-	appCtx.Logger.Debug("Segment not in cache, proxying from upstream", "key", segmentKey)
-	w.Header().Set("X-Cache-Status", "MISS")
+	appCtx.Logger.Debug("Serving segment from cache", "key", segmentKey)
 
-	// --- 从此处开始是原始代理逻辑的改编版 ---
-
-	cachedEntry.Mux.RLock()
-	streamMap, streamOk := cachedEntry.PrecomputedData[streamType]
-	if !streamOk {
-		cachedEntry.Mux.RUnlock()
-		appCtx.Logger.Warn("Precomputed data for streamType not found", "stream_type", streamType, "channel_name", channelCfg.Name, "channel_id", channelCfg.ID)
-		http.NotFound(w, r)
-		return
-	}
-	precomputed, qualityOk := streamMap[qualityOrLang]
-	cachedEntry.Mux.RUnlock()
-
-	if !qualityOk {
-		appCtx.Logger.Warn("Precomputed data for quality/lang not found", "stream_type", streamType, "quality_or_lang", qualityOrLang, "channel_name", channelCfg.Name, "channel_id", channelCfg.ID)
-		http.NotFound(w, r)
-		return
+	// For init segments, set a long cache time as they are static.
+	if strings.Contains(segmentName, "init.m4s") {
+		w.Header().Set("Cache-Control", "public, max-age=86400") // Cache for 24 hours
 	}
 
-	resolvedSegmentBaseURL := precomputed.ResolvedBaseURL
-	segTemplate := precomputed.SegmentTemplate
-	representationID := precomputed.RepresentationID
-
-	if segTemplate == nil {
-		appCtx.Logger.Error("SegmentTemplate missing in precomputed data", "stream_type", streamType, "quality_or_lang", qualityOrLang, "channel_name", channelCfg.Name, "channel_id", channelCfg.ID)
-		http.Error(w, "Invalid MPD data (no SegmentTemplate)", http.StatusInternalServerError)
-		return
-	}
-
-	var relativeSegmentPath string
-	hlsSegmentIdentifier := strings.TrimSuffix(segmentName, ".m4s")
-	mpdPathSegmentIdentifier := hlsSegmentIdentifier
-
-	if mpdPathSegmentIdentifier == "init" {
-		if segTemplate.Initialization == "" {
-			http.Error(w, "MPD has no Initialization segment", http.StatusNotFound)
-			return
-		}
-		relativeSegmentPath = strings.ReplaceAll(segTemplate.Initialization, "$RepresentationID$", representationID)
-	} else {
-		if segTemplate.Media == "" {
-			http.Error(w, "MPD has no Media segment template", http.StatusInternalServerError)
-			return
-		}
-		tempPath := strings.ReplaceAll(segTemplate.Media, "$RepresentationID$", representationID)
-		if strings.Contains(tempPath, "$Time$") {
-			relativeSegmentPath = strings.ReplaceAll(tempPath, "$Time$", mpdPathSegmentIdentifier)
-		} else if strings.Contains(tempPath, "$Number$") {
-			relativeSegmentPath = strings.ReplaceAll(tempPath, "$Number$", mpdPathSegmentIdentifier)
-		} else {
-			relativeSegmentPath = tempPath
-		}
-	}
-
-	if relativeSegmentPath == "" {
-		http.Error(w, "Could not determine upstream segment path", http.StatusInternalServerError)
-		return
-	}
-
-	upstreamURLStr := resolvedSegmentBaseURL + relativeSegmentPath
-
-	// --- 获取、代理和回填 ---
-	const maxRetries = 3
-	var upstreamResp *http.Response
-	for i := 0; i < maxRetries; i++ {
-		httpClientReq, reqErr := http.NewRequest("GET", upstreamURLStr, nil)
-		if reqErr != nil {
-			http.Error(w, "Failed to create upstream request", http.StatusInternalServerError)
-			return
-		}
-		if channelCfg.UserAgent != "" {
-			httpClientReq.Header.Set("User-Agent", channelCfg.UserAgent)
-		}
-
-		upstreamResp, err = appCtx.HTTPClient.Do(httpClientReq)
-		if err == nil && upstreamResp.StatusCode == http.StatusOK {
-			break // 成功
-		}
-		if upstreamResp != nil {
-			upstreamResp.Body.Close()
-		}
-		if i == maxRetries-1 {
-			http.Error(w, "Failed to fetch upstream segment", http.StatusBadGateway)
-			return
-		}
-	}
-	defer upstreamResp.Body.Close()
-
-	// 读取主体以进行缓存和代理
-	bodyBytes, readErr := io.ReadAll(upstreamResp.Body)
-	if readErr != nil {
-		http.Error(w, "Failed to read upstream response", http.StatusInternalServerError)
-		return
-	}
-
-	// 回填缓存
-	contentType := upstreamResp.Header.Get("Content-Type")
-	if contentType == "" {
-		contentType = "application/octet-stream"
-	}
-	cachedEntry.SegmentCache.Lock()
-	cachedEntry.SegmentCache.Segments[segmentKey] = &mpd_manager.CachedSegment{
-		Data:        bodyBytes,
-		ContentType: contentType,
-		FetchedAt:   time.Now(),
-	}
-	cachedEntry.SegmentCache.Unlock()
-	appCtx.Logger.Debug("Segment cached after miss", "key", segmentKey)
-
-	// 将响应代理回客户端
-	for key, values := range upstreamResp.Header {
-		for _, value := range values {
-			// 仅代理必要的头信息
-			if key == "Content-Length" || key == "ETag" || key == "Last-Modified" || key == "Cache-Control" || key == "Expires" || key == "Date" {
-				w.Header().Add(key, value)
-			}
-		}
-	}
-	w.Header().Set("Content-Type", contentType)
-	// Content-Length 将由 http.ResponseWriter 自动设置
-
+	w.Header().Set("Content-Type", cachedSeg.ContentType)
+	w.Header().Set("Content-Length", strconv.Itoa(len(cachedSeg.Data)))
+	w.Header().Set("X-Cache-Status", "HIT")
 	w.WriteHeader(http.StatusOK)
-	_, copyErr := w.Write(bodyBytes)
-	if copyErr != nil {
-		if strings.Contains(copyErr.Error(), "broken pipe") {
-			appCtx.Logger.Info("Client disconnected while proxying segment", "key", segmentKey, "error", copyErr)
+	_, err := w.Write(cachedSeg.Data)
+	if err != nil {
+		if strings.Contains(err.Error(), "broken pipe") {
+			appCtx.Logger.Info("Client disconnected while serving cached segment", "key", segmentKey, "error", err)
 		} else {
-			appCtx.Logger.Error("Error copying segment data to client", "key", segmentKey, "error", copyErr)
+			appCtx.Logger.Error("Error writing cached segment to client", "key", segmentKey, "error", err)
 		}
 	}
 }

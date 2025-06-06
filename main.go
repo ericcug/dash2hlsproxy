@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log/slog"
 	"net/http"
@@ -55,7 +56,7 @@ func main() {
 	}
 
 	// 记录加载配置中的一些信息
-	logger.Info("Successfully loaded configuration", "name", cfg.Name, "id", cfg.ID)
+	logger.Info("Successfully loaded configuration", "name", cfg.Name, "id", cfg.ID, "user_agent", cfg.UserAgent)
 	logger.Info("Channel details", "count", len(cfg.Channels))
 
 	for i, channel := range cfg.Channels {
@@ -65,7 +66,6 @@ func main() {
 			"name", channel.Name,
 			"id", channel.ID,
 			"manifest_url", channel.Manifest,
-			"user_agent", channel.UserAgent,
 			"has_key", hasKey,
 		)
 	}
@@ -73,19 +73,24 @@ func main() {
 	// --- 设置 HTTP 服务器 ---
 	logger.Info("Configuration loaded. Setting up HTTP server...")
 
-	mpdMngr := mpd_manager.NewMPDManager(cfg, logger.With("module", "mpd_manager"))
-
 	// 创建一个带有优化传输的共享 HTTP 客户端
 	sharedHTTPClient := &http.Client{
 		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
-			MaxIdleConns: 100,
-			// 根据预期的上游服务器数量进行调整
-			MaxIdleConnsPerHost: 10,
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10, // 根据预期的上游服务器数量进行调整
 			IdleConnTimeout:     90 * time.Second,
 			// 如果需要，可以添加其他设置，如 TLSHandshakeTimeout、ExpectContinueTimeout
 		},
 	}
+
+	mpdMngr := mpd_manager.NewMPDManager(cfg, logger.With("module", "mpd_manager"), sharedHTTPClient)
+
+	// 启动下载器和缓存清理器
+	mpdMngr.Downloader.Start(context.Background())
+
+	// 启动后台缓存清理任务
+	mpdMngr.StartJanitor(context.Background())
 
 	appCtx := &handler.AppContext{
 		Config:     cfg,

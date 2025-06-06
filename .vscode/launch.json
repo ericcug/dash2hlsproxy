@@ -1,0 +1,21 @@
+{
+	"version": "0.2.0",
+	"configurations": [
+		{
+			"name": "Launch Go Program with mytv.json",
+			"type": "go",
+			"request": "launch",
+			"mode": "auto",
+			"program": "${workspaceFolder}/main.go",
+			"args": [
+				"-L",
+				":4399",
+				"-l",
+				"info",
+				"-c",
+				"sampledata/mytv.json"
+			],
+			"backend": "default"
+		}
+	]
+}
