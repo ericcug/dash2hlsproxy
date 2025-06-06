@@ -77,7 +77,7 @@ func main() {
 
 	// 创建一个带有优化传输的共享 HTTP 客户端
 	sharedHTTPClient := &http.Client{
-		Timeout: 20 * time.Second,
+		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
 			MaxIdleConns: 100,
 			// 根据预期的上游服务器数量进行调整

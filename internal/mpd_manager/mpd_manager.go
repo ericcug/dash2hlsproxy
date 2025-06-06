@@ -110,7 +110,7 @@ func (sp *segmentPreloader) worker(ctx context.Context) {
 
 			// 1. 首先检查缓存中是否已存在
 			cachedEntry.SegmentCache.RLock()
-			_, segmentExists := cachedEntry.SegmentCache.segments[task.SegmentKey]
+			_, segmentExists := cachedEntry.SegmentCache.Segments[task.SegmentKey]
 			cachedEntry.SegmentCache.RUnlock()
 
 			if segmentExists {
@@ -130,7 +130,7 @@ func (sp *segmentPreloader) worker(ctx context.Context) {
 
 			// 执行下载
 			slog.Debug("Preloader worker: Downloading segment", "segment_key", task.SegmentKey, "channel_id", task.ChannelID, "url", task.UpstreamURL)
-			data, err := sp.fetchSegment(task.UpstreamURL, task.UserAgent)
+			data, contentType, err := sp.fetchSegment(task.UpstreamURL, task.UserAgent)
 
 			// 下载完成后，通知等待者
 			if ch, ok := cachedEntry.SegmentCache.downloading.Load(task.SegmentKey); ok {
@@ -145,12 +145,13 @@ func (sp *segmentPreloader) worker(ctx context.Context) {
 				// Double check in case it was cleared
 				if cachedEntry.SegmentCache == nil {
 					cachedEntry.SegmentCache = &SegmentCache{
-						segments: make(map[string]*CachedSegment),
+						Segments: make(map[string]*CachedSegment),
 					}
 				}
-				cachedEntry.SegmentCache.segments[task.SegmentKey] = &CachedSegment{
-					Data:      data,
-					FetchedAt: time.Now(),
+				cachedEntry.SegmentCache.Segments[task.SegmentKey] = &CachedSegment{
+					Data:        data,
+					ContentType: contentType,
+					FetchedAt:   time.Now(),
 				}
 				cachedEntry.Mux.Unlock()
 				slog.Debug("Preloader worker: Successfully cached segment", "segment_key", task.SegmentKey, "channel_id", task.ChannelID)
@@ -169,10 +170,10 @@ func (sp *segmentPreloader) worker(ctx context.Context) {
 }
 
 // fetchSegment 实际执行 SEGMENT 下载
-func (sp *segmentPreloader) fetchSegment(url string, userAgent string) ([]byte, error) {
+func (sp *segmentPreloader) fetchSegment(url string, userAgent string) ([]byte, string, error) {
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("创建请求失败: %w", err)
+		return nil, "", fmt.Errorf("创建请求失败: %w", err)
 	}
 	if userAgent != "" {
 		req.Header.Set("User-Agent", userAgent)
@@ -180,19 +181,20 @@ func (sp *segmentPreloader) fetchSegment(url string, userAgent string) ([]byte, 
 
 	resp, err := sp.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("请求上游 SEGMENT 失败: %w", err)
+		return nil, "", fmt.Errorf("请求上游 SEGMENT 失败: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("上游 SEGMENT 返回非 200 状态码: %s", resp.Status)
+		return nil, "", fmt.Errorf("上游 SEGMENT 返回非 200 状态码: %s", resp.Status)
 	}
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("读取 SEGMENT 数据失败: %w", err)
+		return nil, "", fmt.Errorf("读取 SEGMENT 数据失败: %w", err)
 	}
-	return data, nil
+	contentType := resp.Header.Get("Content-Type")
+	return data, contentType, nil
 }
 
 // UpdateSegmentsToPreload 更新指定频道需要预加载的 SEGMENT 列表
@@ -216,7 +218,7 @@ func (sp *segmentPreloader) UpdateSegmentsToPreload(channelID string, segmentsTo
 		})
 
 		for _, key := range segmentsToDelete {
-			delete(cachedEntry.SegmentCache.segments, key)
+			delete(cachedEntry.SegmentCache.Segments, key)
 			// 从跟踪列表中删除
 			currentSegments.Delete(key)
 			slog.Debug("Preloader: Removed expired segment from cache", "segment_key", key, "channel_id", channelID)
@@ -291,14 +293,15 @@ type CachedMPD struct {
 
 // CachedSegment 存储 SEGMENT 数据及其获取时间。
 type CachedSegment struct {
-	Data      []byte
-	FetchedAt time.Time
+	Data        []byte
+	ContentType string
+	FetchedAt   time.Time
 }
 
 // SegmentCache 管理特定频道/表示的缓存 SEGMENT。
 type SegmentCache struct {
 	sync.RWMutex
-	segments map[string]*CachedSegment // 键: streamType/qualityOrLang/segmentIdentifier
+	Segments map[string]*CachedSegment // 键: streamType/qualityOrLang/segmentIdentifier
 	// downloading 用于协调并发下载。键: segmentKey, 值: chan struct{} (下载完成信号)
 	downloading sync.Map
 }
@@ -362,7 +365,7 @@ func (m *MPDManager) GetMPD(channelCfg *config.ChannelConfig) (string, *mpd.MPD,
 			PrecomputedData:      make(map[string]map[string]PrecomputedSegmentData),
 			// 初始化 SegmentCache
 			SegmentCache: &SegmentCache{
-				segments: make(map[string]*CachedSegment),
+				Segments: make(map[string]*CachedSegment),
 			},
 			// 缓冲 channel，防止阻塞
 			preloaderUpdateCh: make(chan struct{}, 1),

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"dash2hlsproxy/internal/config"
 	"dash2hlsproxy/internal/mpd_manager"
@@ -139,7 +140,7 @@ func (appCtx *AppContext) mediaPlaylistHandler(w http.ResponseWriter, r *http.Re
 }
 
 func (appCtx *AppContext) segmentProxyHandler(w http.ResponseWriter, r *http.Request, channelCfg *config.ChannelConfig, streamType string, qualityOrLang string, segmentName string) {
-	// 确保 MPD 是最新的。
+	// 确保 MPD 是最新的，这对于获取最新的 SegmentCache 至关重要
 	_, _, err := appCtx.MPDManager.GetMPD(channelCfg)
 	if err != nil {
 		appCtx.Logger.Error("Failed to get MPD for segment proxy", "channel_name", channelCfg.Name, "channel_id", channelCfg.ID, "error", err)
@@ -148,11 +149,42 @@ func (appCtx *AppContext) segmentProxyHandler(w http.ResponseWriter, r *http.Req
 	}
 
 	cachedEntry, exists := appCtx.MPDManager.GetCachedEntry(channelCfg.ID)
-	if !exists {
-		appCtx.Logger.Error("Cached entry not found for segment proxy", "channel_name", channelCfg.Name, "channel_id", channelCfg.ID)
+	if !exists || cachedEntry.SegmentCache == nil {
+		appCtx.Logger.Error("Cached entry or SegmentCache not found for segment proxy", "channel_name", channelCfg.Name, "channel_id", channelCfg.ID)
 		http.Error(w, "MPD data not available", http.StatusInternalServerError)
 		return
 	}
+
+	// 构造用于 HLS URL 的分段路径，它将作为缓存键
+	segmentKey := fmt.Sprintf("/hls/%s/%s/%s/%s", channelCfg.ID, streamType, qualityOrLang, segmentName)
+
+	// 1. 检查缓存
+	cachedEntry.SegmentCache.RLock()
+	cachedSeg, segmentExists := cachedEntry.SegmentCache.Segments[segmentKey]
+	cachedEntry.SegmentCache.RUnlock()
+
+	if segmentExists {
+		appCtx.Logger.Debug("Serving segment from cache", "key", segmentKey)
+		w.Header().Set("Content-Type", cachedSeg.ContentType)
+		w.Header().Set("Content-Length", strconv.Itoa(len(cachedSeg.Data)))
+		w.Header().Set("X-Cache-Status", "HIT")
+		w.WriteHeader(http.StatusOK)
+		_, err := w.Write(cachedSeg.Data)
+		if err != nil {
+			if strings.Contains(err.Error(), "broken pipe") {
+				appCtx.Logger.Info("Client disconnected while serving cached segment", "key", segmentKey, "error", err)
+			} else {
+				appCtx.Logger.Error("Error writing cached segment to client", "key", segmentKey, "error", err)
+			}
+		}
+		return
+	}
+
+	// 2. 缓存未命中：从上游代理并回填缓存
+	appCtx.Logger.Debug("Segment not in cache, proxying from upstream", "key", segmentKey)
+	w.Header().Set("X-Cache-Status", "MISS")
+
+	// --- 从此处开始是原始代理逻辑的改编版 ---
 
 	cachedEntry.Mux.RLock()
 	streamMap, streamOk := cachedEntry.PrecomputedData[streamType]
@@ -163,7 +195,6 @@ func (appCtx *AppContext) segmentProxyHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 	precomputed, qualityOk := streamMap[qualityOrLang]
-	// 尽早解锁，因为我们已经复制了必要的数据或确定未找到
 	cachedEntry.Mux.RUnlock()
 
 	if !qualityOk {
@@ -178,28 +209,22 @@ func (appCtx *AppContext) segmentProxyHandler(w http.ResponseWriter, r *http.Req
 
 	if segTemplate == nil {
 		appCtx.Logger.Error("SegmentTemplate missing in precomputed data", "stream_type", streamType, "quality_or_lang", qualityOrLang, "channel_name", channelCfg.Name, "channel_id", channelCfg.ID)
-		http.Error(w, "Invalid MPD data (no SegmentTemplate in precomputed data)", http.StatusInternalServerError)
+		http.Error(w, "Invalid MPD data (no SegmentTemplate)", http.StatusInternalServerError)
 		return
 	}
 
 	var relativeSegmentPath string
-	hlsSegmentIdentifier := ""
-
-	hlsSegmentIdentifier = strings.TrimSuffix(segmentName, ".m4s")
-
-	// 现在直接使用 hlsSegmentIdentifier
+	hlsSegmentIdentifier := strings.TrimSuffix(segmentName, ".m4s")
 	mpdPathSegmentIdentifier := hlsSegmentIdentifier
 
 	if mpdPathSegmentIdentifier == "init" {
 		if segTemplate.Initialization == "" {
-			appCtx.Logger.Error("HLS requested 'init.m4s' but MPD has no Initialization", "stream_type", streamType, "quality_or_lang", qualityOrLang)
 			http.Error(w, "MPD has no Initialization segment", http.StatusNotFound)
 			return
 		}
 		relativeSegmentPath = strings.ReplaceAll(segTemplate.Initialization, "$RepresentationID$", representationID)
 	} else {
 		if segTemplate.Media == "" {
-			appCtx.Logger.Error("MPD has no Media template", "stream_type", streamType, "quality_or_lang", qualityOrLang)
 			http.Error(w, "MPD has no Media segment template", http.StatusInternalServerError)
 			return
 		}
@@ -209,62 +234,85 @@ func (appCtx *AppContext) segmentProxyHandler(w http.ResponseWriter, r *http.Req
 		} else if strings.Contains(tempPath, "$Number$") {
 			relativeSegmentPath = strings.ReplaceAll(tempPath, "$Number$", mpdPathSegmentIdentifier)
 		} else {
-			appCtx.Logger.Warn("MPD Media template does not contain $Time$ or $Number$. Using template directly.", "stream_type", streamType, "quality_or_lang", qualityOrLang, "template", tempPath)
-			// 或作为错误处理
 			relativeSegmentPath = tempPath
 		}
 	}
 
 	if relativeSegmentPath == "" {
-		appCtx.Logger.Error("Failed to determine relativeSegmentPath for HLS segment", "segment_name", segmentName)
 		http.Error(w, "Could not determine upstream segment path", http.StatusInternalServerError)
 		return
 	}
 
 	upstreamURLStr := resolvedSegmentBaseURL + relativeSegmentPath
 
-	httpClientReq, err := http.NewRequest("GET", upstreamURLStr, nil)
-	if err != nil {
-		appCtx.Logger.Error("Error creating request for upstream segment", "url", upstreamURLStr, "error", err)
-		http.Error(w, "Failed to create upstream request", http.StatusInternalServerError)
-		return
-	}
-	if channelCfg.UserAgent != "" {
-		httpClientReq.Header.Set("User-Agent", channelCfg.UserAgent)
-	}
+	// --- 获取、代理和回填 ---
+	const maxRetries = 3
+	var upstreamResp *http.Response
+	for i := 0; i < maxRetries; i++ {
+		httpClientReq, reqErr := http.NewRequest("GET", upstreamURLStr, nil)
+		if reqErr != nil {
+			http.Error(w, "Failed to create upstream request", http.StatusInternalServerError)
+			return
+		}
+		if channelCfg.UserAgent != "" {
+			httpClientReq.Header.Set("User-Agent", channelCfg.UserAgent)
+		}
 
-	upstreamResp, err := appCtx.HTTPClient.Do(httpClientReq)
-	if err != nil {
-		appCtx.Logger.Error("Error fetching upstream segment", "url", upstreamURLStr, "error", err)
-		http.Error(w, "Failed to fetch upstream segment", http.StatusBadGateway)
-		return
+		upstreamResp, err = appCtx.HTTPClient.Do(httpClientReq)
+		if err == nil && upstreamResp.StatusCode == http.StatusOK {
+			break // 成功
+		}
+		if upstreamResp != nil {
+			upstreamResp.Body.Close()
+		}
+		if i == maxRetries-1 {
+			http.Error(w, "Failed to fetch upstream segment", http.StatusBadGateway)
+			return
+		}
 	}
 	defer upstreamResp.Body.Close()
 
-	if upstreamResp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(io.LimitReader(upstreamResp.Body, 1024))
-		appCtx.Logger.Error("Upstream segment fetch failed", "url", upstreamURLStr, "status", upstreamResp.Status, "body", string(bodyBytes))
-		http.Error(w, fmt.Sprintf("Failed to fetch upstream segment: %s", upstreamResp.Status), upstreamResp.StatusCode)
+	// 读取主体以进行缓存和代理
+	bodyBytes, readErr := io.ReadAll(upstreamResp.Body)
+	if readErr != nil {
+		http.Error(w, "Failed to read upstream response", http.StatusInternalServerError)
 		return
 	}
 
-	// 对未转换的段进行标准代理
+	// 回填缓存
+	contentType := upstreamResp.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	cachedEntry.SegmentCache.Lock()
+	cachedEntry.SegmentCache.Segments[segmentKey] = &mpd_manager.CachedSegment{
+		Data:        bodyBytes,
+		ContentType: contentType,
+		FetchedAt:   time.Now(),
+	}
+	cachedEntry.SegmentCache.Unlock()
+	appCtx.Logger.Debug("Segment cached after miss", "key", segmentKey)
+
+	// 将响应代理回客户端
 	for key, values := range upstreamResp.Header {
 		for _, value := range values {
-			if key == "Content-Type" || key == "Content-Length" || key == "ETag" || key == "Last-Modified" || key == "Cache-Control" || key == "Expires" || key == "Date" {
+			// 仅代理必要的头信息
+			if key == "Content-Length" || key == "ETag" || key == "Last-Modified" || key == "Cache-Control" || key == "Expires" || key == "Date" {
 				w.Header().Add(key, value)
 			}
 		}
 	}
-	if w.Header().Get("Content-Type") == "" {
-		appCtx.Logger.Warn("Upstream response missing Content-Type. Defaulting to application/octet-stream.", "url", upstreamURLStr)
-		w.Header().Set("Content-Type", "application/octet-stream")
-	}
+	w.Header().Set("Content-Type", contentType)
+	// Content-Length 将由 http.ResponseWriter 自动设置
 
 	w.WriteHeader(http.StatusOK)
-	_, err = io.Copy(w, upstreamResp.Body)
-	if err != nil {
-		appCtx.Logger.Error("Error copying segment data to client", "url", upstreamURLStr, "error", err)
+	_, copyErr := w.Write(bodyBytes)
+	if copyErr != nil {
+		if strings.Contains(copyErr.Error(), "broken pipe") {
+			appCtx.Logger.Info("Client disconnected while proxying segment", "key", segmentKey, "error", copyErr)
+		} else {
+			appCtx.Logger.Error("Error copying segment data to client", "key", segmentKey, "error", copyErr)
+		}
 	}
 }
 
