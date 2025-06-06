@@ -2,8 +2,12 @@ package mpd_manager
 
 import (
 	"bytes"
+	"context"
 	"fmt"
-	"log"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -11,49 +15,256 @@ import (
 
 	"dash2hlsproxy/internal/config"
 	"dash2hlsproxy/internal/mpd"
-	"net/url" // Added for precomputed data
 )
 
-// Helper function to identify STPP tracks
-// IsSTPPTrack checks if the AdaptationSet represents an STPP subtitle track.
-func IsSTPPTrack(as *mpd.AdaptationSet) bool {
-	if as == nil {
-		return false
-	}
-	// Check MimeType for "application/mp4" and Codecs for "stpp"
-	// Also consider if ContentType is "text" and MimeType is "application/mp4" without specific codecs,
-	// but the primary indicator is codecs="stpp".
-	isMP4 := strings.Contains(as.MimeType, "application/mp4")
-	hasSTPPCodec := false
-	if len(as.Representations) > 0 { // Check codecs in representations
-		for _, rep := range as.Representations {
-			if strings.Contains(strings.ToLower(rep.Codecs), "stpp") {
-				hasSTPPCodec = true
-				break
-			}
-		}
-	}
-	// Fallback to checking AdaptationSet's codecs if not found in representations
-	// (Though typically codecs are on Representation)
-	// For simplicity, we'll assume codecs on Representation is sufficient for now.
+// 在实时媒体播放列表中保留的段数
+const numLiveSegments = 5
 
-	// A more direct check if AdaptationSet itself has codecs (less common for subtitles)
-	// if !hasSTPPCodec && strings.Contains(strings.ToLower(as.Codecs), "stpp") {
-	// 	hasSTPPCodec = true
-	// }
+// 全局最大并发下载数
+const globalMaxConcurrentDownloads = 5
 
-	return isMP4 && hasSTPPCodec
+// SegmentDownloadTask 定义一个 SEGMENT 下载任务
+type SegmentDownloadTask struct {
+	ChannelID   string
+	SegmentKey  string // 缓存键: streamType/qualityOrLang/segmentIdentifier
+	UpstreamURL string
+	UserAgent   string
 }
 
-const numLiveSegments = 5 // Number of segments to keep in a live media playlist
+// SegmentPreloader 接口定义了 SEGMENT 预加载器的行为
+type SegmentPreloader interface {
+	Start(ctx context.Context)
+	Stop()
+	UpdateSegmentsToPreload(channelID string, segmentsToCache map[string]string)
+	// SetHTTPClient 允许在创建后设置 HTTP 客户端
+	SetHTTPClient(client *http.Client)
+}
+
+// segmentPreloader 是 SegmentPreloader 接口的具体实现
+type segmentPreloader struct {
+	httpClient *http.Client
+	// 待下载任务队列
+	downloadQueue chan *SegmentDownloadTask
+	// 控制全局并发度的信号量
+	activeDownloads chan struct{}
+
+	// channelSegments 跟踪每个频道当前需要缓存的 SEGMENT 键
+	// map[channelID]map[segmentKey]struct{}
+	// 使用 sync.Map 替代 map[string]map[string]struct{} 以避免外部锁
+	channelSegments sync.Map
+
+	// 停止信号
+	stopCh chan struct{}
+	// 等待所有 worker 协程退出
+	wg sync.WaitGroup
+}
+
+// NewSegmentPreloader 创建一个新的 SegmentPreloader 实例
+func NewSegmentPreloader() SegmentPreloader {
+	return &segmentPreloader{
+		// 缓冲队列，防止阻塞
+		downloadQueue:   make(chan *SegmentDownloadTask, 100),
+		activeDownloads: make(chan struct{}, globalMaxConcurrentDownloads),
+		stopCh:          make(chan struct{}),
+	}
+}
+
+// SetHTTPClient 设置 HTTP 客户端
+func (sp *segmentPreloader) SetHTTPClient(client *http.Client) {
+	sp.httpClient = client
+}
+
+// Start 启动预加载器的 worker 协程
+func (sp *segmentPreloader) Start(ctx context.Context) {
+	for i := 0; i < globalMaxConcurrentDownloads; i++ {
+		sp.wg.Add(1)
+		go sp.worker(ctx)
+	}
+	slog.Info("SegmentPreloader: Started worker goroutines", "count", globalMaxConcurrentDownloads)
+}
+
+// Stop 停止预加载器
+func (sp *segmentPreloader) Stop() {
+	close(sp.stopCh)
+	sp.wg.Wait()
+	slog.Info("SegmentPreloader: Stopped.")
+}
+
+// worker 协程从下载队列中获取任务并执行下载
+func (sp *segmentPreloader) worker(ctx context.Context) {
+	defer sp.wg.Done()
+	for {
+		select {
+		case task := <-sp.downloadQueue:
+			// 获取一个并发槽
+			sp.activeDownloads <- struct{}{}
+
+			// 检查任务是否有效
+			cachedEntry, exists := mpdManagerInstance.GetCachedEntry(task.ChannelID)
+			if !exists || cachedEntry.SegmentCache == nil {
+				slog.Warn("Preloader worker: Channel or its SegmentCache not found. Skipping download.", "channel_id", task.ChannelID, "segment_key", task.SegmentKey)
+				// 释放并发槽
+				<-sp.activeDownloads
+				continue
+			}
+
+			// 1. 首先检查缓存中是否已存在
+			cachedEntry.SegmentCache.RLock()
+			_, segmentExists := cachedEntry.SegmentCache.segments[task.SegmentKey]
+			cachedEntry.SegmentCache.RUnlock()
+
+			if segmentExists {
+				// 如果已经存在，则跳过下载
+				// 释放并发槽
+				<-sp.activeDownloads
+				continue
+			}
+
+			// 2. 如果缓存中不存在，再检查是否正在被其他 worker 下载
+			if _, loaded := cachedEntry.SegmentCache.downloading.LoadOrStore(task.SegmentKey, make(chan struct{})); loaded {
+				// 另一个 goroutine 正在下载，跳过
+				// 释放并发槽
+				<-sp.activeDownloads
+				continue
+			}
+
+			// 执行下载
+			slog.Debug("Preloader worker: Downloading segment", "segment_key", task.SegmentKey, "channel_id", task.ChannelID, "url", task.UpstreamURL)
+			data, err := sp.fetchSegment(task.UpstreamURL, task.UserAgent)
+
+			// 下载完成后，通知等待者
+			if ch, ok := cachedEntry.SegmentCache.downloading.Load(task.SegmentKey); ok {
+				close(ch.(chan struct{}))
+				cachedEntry.SegmentCache.downloading.Delete(task.SegmentKey)
+			}
+
+			if err != nil {
+				slog.Error("Preloader worker: Failed to download segment", "segment_key", task.SegmentKey, "channel_id", task.ChannelID, "error", err)
+			} else {
+				cachedEntry.Mux.Lock()
+				// Double check in case it was cleared
+				if cachedEntry.SegmentCache == nil {
+					cachedEntry.SegmentCache = &SegmentCache{
+						segments: make(map[string]*CachedSegment),
+					}
+				}
+				cachedEntry.SegmentCache.segments[task.SegmentKey] = &CachedSegment{
+					Data:      data,
+					FetchedAt: time.Now(),
+				}
+				cachedEntry.Mux.Unlock()
+				slog.Debug("Preloader worker: Successfully cached segment", "segment_key", task.SegmentKey, "channel_id", task.ChannelID)
+			}
+			// 释放并发槽
+			<-sp.activeDownloads
+
+		case <-sp.stopCh:
+			slog.Info("Preloader worker: Stop signal received. Exiting.")
+			return
+		case <-ctx.Done():
+			slog.Info("Preloader worker: Context cancelled. Exiting.")
+			return
+		}
+	}
+}
+
+// fetchSegment 实际执行 SEGMENT 下载
+func (sp *segmentPreloader) fetchSegment(url string, userAgent string) ([]byte, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("创建请求失败: %w", err)
+	}
+	if userAgent != "" {
+		req.Header.Set("User-Agent", userAgent)
+	}
+
+	resp, err := sp.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("请求上游 SEGMENT 失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("上游 SEGMENT 返回非 200 状态码: %s", resp.Status)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("读取 SEGMENT 数据失败: %w", err)
+	}
+	return data, nil
+}
+
+// UpdateSegmentsToPreload 更新指定频道需要预加载的 SEGMENT 列表
+func (sp *segmentPreloader) UpdateSegmentsToPreload(channelID string, segmentsToCache map[string]string) {
+	// 获取当前频道已知的 SEGMENT 列表
+	currentSegmentsVal, _ := sp.channelSegments.LoadOrStore(channelID, &sync.Map{})
+	currentSegments := currentSegmentsVal.(*sync.Map)
+
+	// 从缓存中删除旧 SEGMENT
+	segmentsToDelete := make([]string, 0)
+	// 假设 mpdManagerInstance 可用
+	cachedEntry, exists := mpdManagerInstance.GetCachedEntry(channelID)
+	if exists && cachedEntry.SegmentCache != nil {
+		cachedEntry.Mux.Lock()
+		currentSegments.Range(func(key, value interface{}) bool {
+			segmentKey := key.(string)
+			if _, existsInNewList := segmentsToCache[segmentKey]; !existsInNewList {
+				segmentsToDelete = append(segmentsToDelete, segmentKey)
+			}
+			return true
+		})
+
+		for _, key := range segmentsToDelete {
+			delete(cachedEntry.SegmentCache.segments, key)
+			// 从跟踪列表中删除
+			currentSegments.Delete(key)
+			slog.Debug("Preloader: Removed expired segment from cache", "segment_key", key, "channel_id", channelID)
+		}
+		cachedEntry.Mux.Unlock()
+	}
+
+	// 识别需要添加的新 SEGMENT 并加入下载队列
+	for segmentKey, upstreamURL := range segmentsToCache {
+		if _, loaded := currentSegments.LoadOrStore(segmentKey, struct{}{}); !loaded {
+			// 新的 SEGMENT，加入下载队列
+			var userAgent string
+			if mpdManagerInstance != nil && mpdManagerInstance.Config != nil && mpdManagerInstance.Config.ChannelMap != nil {
+				if channelCfg, ok := mpdManagerInstance.Config.ChannelMap[channelID]; ok {
+					userAgent = channelCfg.UserAgent
+				}
+			}
+
+			sp.downloadQueue <- &SegmentDownloadTask{
+				ChannelID:   channelID,
+				SegmentKey:  segmentKey,
+				UpstreamURL: upstreamURL,
+				UserAgent:   userAgent,
+			}
+			slog.Debug("Preloader: Added new segment to download queue", "segment_key", segmentKey, "channel_id", channelID)
+		}
+	}
+}
+
+// mpdManagerInstance 是一个全局变量，用于在 SegmentPreloader 中访问 MPDManager
+// 这是一个临时的解决方案，更好的方式是通过依赖注入传递
+var mpdManagerInstance *MPDManager
+
+// SetMPDManagerInstance 设置全局 MPDManager 实例
+func SetMPDManagerInstance(m *MPDManager) {
+	mpdManagerInstance = m
+}
 
 // PrecomputedSegmentData holds readily usable data for a specific stream/quality.
 type PrecomputedSegmentData struct {
-	ResolvedBaseURL  string // Fully resolved base URL for this segment set
+	// Fully resolved base URL for this segment set
+	ResolvedBaseURL  string
 	SegmentTemplate  *mpd.SegmentTemplate
 	RepresentationID string
-	AdaptationSet    *mpd.AdaptationSet  // Reference to the AS
-	Representation   *mpd.Representation // Reference to the Rep
+	// Reference to the AS
+	AdaptationSet *mpd.AdaptationSet
+	// Reference to the Rep
+	Representation *mpd.Representation
 }
 
 // CachedMPD holds a parsed MPD, its fetch time, and the final URL it was fetched from.
@@ -63,15 +274,33 @@ type CachedMPD struct {
 	FinalMPDURL          string
 	Mux                  sync.RWMutex
 	LastAccessedAt       time.Time
-	stopAutoUpdateCh     chan struct{}     // Channel to signal the auto-updater to stop
-	HLSBaseMediaSequence uint64            // Our own media sequence number for HLS playlists
-	LastMPDPublishTime   time.Time         // Last seen MPD publish time to track actual updates
-	InitialBaseURL       string            // BaseURL from the first successful fetch for this channel
-	InitialBaseURLIsSet  bool              // True if InitialBaseURL has been populated
-	MasterPlaylist       string            // Cached HLS Master Playlist
-	MediaPlaylists       map[string]string // Cached HLS Media Playlists (e.g., by representation ID)
+	stopAutoUpdateCh     chan struct{}
+	HLSBaseMediaSequence uint64
+	LastMPDPublishTime   time.Time
+	InitialBaseURL       string
+	InitialBaseURLIsSet  bool
+	MasterPlaylist       string
+	MediaPlaylists       map[string]string
 	// PrecomputedData: map[streamType]map[qualityOrLang]PrecomputedSegmentData
 	PrecomputedData map[string]map[string]PrecomputedSegmentData
+	// 用于 SEGMENT 缓存的新字段
+	SegmentCache *SegmentCache
+	// 用于通知预加载器更新其 SEGMENT 列表
+	preloaderUpdateCh chan struct{}
+}
+
+// CachedSegment 存储 SEGMENT 数据及其获取时间。
+type CachedSegment struct {
+	Data      []byte
+	FetchedAt time.Time
+}
+
+// SegmentCache 管理特定频道/表示的缓存 SEGMENT。
+type SegmentCache struct {
+	sync.RWMutex
+	segments map[string]*CachedSegment // 键: streamType/qualityOrLang/segmentIdentifier
+	// downloading 用于协调并发下载。键: segmentKey, 值: chan struct{} (下载完成信号)
+	downloading sync.Map
 }
 
 // MPDManager manages the MPD cache and updates.
@@ -79,13 +308,18 @@ type MPDManager struct {
 	Config    *config.AppConfig
 	MPDCache  map[string]*CachedMPD
 	CacheLock sync.RWMutex
+	// 全局的 SegmentPreloader 实例
+	Preloader SegmentPreloader
+	Logger    *slog.Logger
 }
 
 // NewMPDManager creates a new MPDManager.
-func NewMPDManager(cfg *config.AppConfig) *MPDManager {
+// Note: The SegmentPreloader must be set after creation, as it depends on HTTPClient from AppContext.
+func NewMPDManager(cfg *config.AppConfig, logger *slog.Logger) *MPDManager {
 	return &MPDManager{
 		Config:   cfg,
 		MPDCache: make(map[string]*CachedMPD),
+		Logger:   logger,
 	}
 }
 
@@ -102,7 +336,6 @@ func (m *MPDManager) GetCachedEntry(channelID string) (*CachedMPD, bool) {
 // GetMPD retrieves a parsed MPD for a channel, using a cache.
 // It returns the final URL from which the MPD was fetched, the parsed MPD, and an error.
 func (m *MPDManager) GetMPD(channelCfg *config.ChannelConfig) (string, *mpd.MPD, error) {
-	// log.Printf("GetMPD: Called for channel %s (%s)", channelCfg.Name, channelCfg.ID) // Removed success log
 	m.CacheLock.RLock()
 	cachedEntry, exists := m.MPDCache[channelCfg.ID]
 	m.CacheLock.RUnlock()
@@ -110,7 +343,6 @@ func (m *MPDManager) GetMPD(channelCfg *config.ChannelConfig) (string, *mpd.MPD,
 	if exists {
 		cachedEntry.Mux.RLock()
 		if entryData := cachedEntry.Data; entryData != nil {
-			// log.Printf("GetMPD: Using cached MPD for channel %s (%s), finalURL: %s, FetchedAt: %s", channelCfg.Name, channelCfg.ID, cachedEntry.FinalMPDURL, cachedEntry.FetchedAt.Format(time.RFC3339)) // Removed success log
 			dataCopy := *entryData
 			finalURLCopy := cachedEntry.FinalMPDURL
 			cachedEntry.LastAccessedAt = time.Now()
@@ -120,15 +352,20 @@ func (m *MPDManager) GetMPD(channelCfg *config.ChannelConfig) (string, *mpd.MPD,
 		cachedEntry.Mux.RUnlock()
 	}
 
-	// log.Printf("GetMPD: Fetching new MPD for channel %s (%s) from manifest: %s", channelCfg.Name, channelCfg.ID, channelCfg.Manifest) // Removed success log
-
 	m.CacheLock.Lock()
 	entry, ok := m.MPDCache[channelCfg.ID]
 	if !ok {
 		entry = &CachedMPD{
-			stopAutoUpdateCh:     make(chan struct{}),
-			HLSBaseMediaSequence: 0, // Initial sequence
+			stopAutoUpdateCh: make(chan struct{}),
+			// Initial sequence
+			HLSBaseMediaSequence: 0,
 			PrecomputedData:      make(map[string]map[string]PrecomputedSegmentData),
+			// 初始化 SegmentCache
+			SegmentCache: &SegmentCache{
+				segments: make(map[string]*CachedSegment),
+			},
+			// 缓冲 channel，防止阻塞
+			preloaderUpdateCh: make(chan struct{}, 1),
 		}
 		m.MPDCache[channelCfg.ID] = entry
 	}
@@ -139,8 +376,8 @@ func (m *MPDManager) GetMPD(channelCfg *config.ChannelConfig) (string, *mpd.MPD,
 
 	// If data exists and was fetched recently by another goroutine, use it.
 	if entry.Data != nil {
-		// log.Printf("GetMPD: MPD for channel %s (%s) was updated by another goroutine or already cached, using it. FinalURL: %s, FetchedAt: %s", channelCfg.Name, channelCfg.ID, entry.FinalMPDURL, entry.FetchedAt.Format(time.RFC3339)) // Removed success log
-		dataCopy := *entry.Data // Create a shallow copy of MPD data for return
+		// Create a shallow copy of MPD data for return
+		dataCopy := *entry.Data
 		finalURLCopy := entry.FinalMPDURL
 		entry.LastAccessedAt = time.Now()
 		// Note: PrecomputedData is part of 'entry' and is protected by its Mux.
@@ -152,23 +389,22 @@ func (m *MPDManager) GetMPD(channelCfg *config.ChannelConfig) (string, *mpd.MPD,
 	// Determine the URL to fetch from (cached final URL or initial manifest URL)
 	urlToFetch := channelCfg.Manifest
 	if entry.FinalMPDURL != "" {
-		// log.Printf("GetMPD: Attempting to refresh MPD from cached FinalMPDURL: %s for channel %s (%s)", entry.FinalMPDURL, channelCfg.Name, channelCfg.ID) // Removed informational log
 		urlToFetch = entry.FinalMPDURL
-	} else {
-		// log.Printf("GetMPD: No cached FinalMPDURL, fetching from initial manifest URL: %s for channel %s (%s)", channelCfg.Manifest, channelCfg.Name, channelCfg.ID) // Removed informational log
 	}
 
 	// Fetch MPD with BaseURL consistency check and retries
 	// Stored InitialBaseURL and InitialBaseURLIsSet are read while 'entry' is locked.
-	newFinalURL, newMPDData, fetchedBaseURL, err := fetchMPDWithBaseURLRetry(
+	newFinalURL, newMPDData, fetchedBaseURL, err := m.fetchMPDWithBaseURLRetry(
 		urlToFetch,
 		channelCfg.UserAgent,
 		channelCfg.ID,
 		channelCfg.Name,
 		entry.InitialBaseURL,
 		entry.InitialBaseURLIsSet,
-		5,             // maxRetries
-		2*time.Second, // retryDelay
+		// maxRetries
+		5,
+		// retryDelay
+		2*time.Second,
 	)
 
 	if err != nil {
@@ -183,13 +419,10 @@ func (m *MPDManager) GetMPD(channelCfg *config.ChannelConfig) (string, *mpd.MPD,
 
 	// If InitialBaseURL wasn't set, and we have MPD data, set it now.
 	if !entry.InitialBaseURLIsSet {
-		entry.InitialBaseURL = fetchedBaseURL // actualBaseURL from the first successful fetch
+		// actualBaseURL from the first successful fetch
+		entry.InitialBaseURL = fetchedBaseURL
 		entry.InitialBaseURLIsSet = true
-		// log.Printf("GetMPD: Initial BaseURL for channel %s (%s) set to: '%s'", channelCfg.ID, channelCfg.Name, entry.InitialBaseURL) // Removed success log
 	}
-
-	// log.Printf("GetMPD: Successfully processed MPD for channel %s (%s). FinalMPDURL: %s. MPD Type: %s, PublishTime: %s, Actual BaseURL: '%s'", // Removed success log
-	//	channelCfg.Name, channelCfg.ID, newFinalURL, newMPDData.Type, newMPDData.PublishTime, fetchedBaseURL)
 
 	entry.Data = newMPDData
 	entry.FetchedAt = time.Now()
@@ -205,54 +438,53 @@ func (m *MPDManager) GetMPD(channelCfg *config.ChannelConfig) (string, *mpd.MPD,
 
 	if ptErr == nil {
 		if entry.LastMPDPublishTime.IsZero() || newPublishTime.After(entry.LastMPDPublishTime) {
-			if !entry.LastMPDPublishTime.IsZero() { // Don't increment for the very first fetch
+			// Don't increment for the very first fetch
+			if !entry.LastMPDPublishTime.IsZero() {
 				entry.HLSBaseMediaSequence++
-				// log.Printf("GetMPD: PublishTime changed for %s. Old: %s, New: %s. Incremented HLSBaseMediaSequence to %d.", channelCfg.ID, entry.LastMPDPublishTime.Format(time.RFC3339), newPublishTime.Format(time.RFC3339), entry.HLSBaseMediaSequence) // Removed success log
-			} else {
-				// log.Printf("GetMPD: First fetch for %s. HLSBaseMediaSequence is %d.", channelCfg.ID, entry.HLSBaseMediaSequence) // Removed success log
 			}
 			entry.LastMPDPublishTime = newPublishTime
 		}
 	} else {
-		log.Printf("GetMPD: Warning - could not parse PublishTime '%s' for channel %s: %v", newMPDData.PublishTime, channelCfg.ID, ptErr)
+		m.Logger.Warn("Could not parse PublishTime", "publish_time", newMPDData.PublishTime, "channel_id", channelCfg.ID, "error", ptErr)
 	}
 
 	if newMPDData.Type != "static" {
 		minUpdatePeriod, errMUP := newMPDData.GetMinimumUpdatePeriod()
 		if errMUP == nil && minUpdatePeriod > 0 {
-			// log.Printf("GetMPD: Channel %s (%s) is dynamic with MinimumUpdatePeriod %s. Starting auto-updater.", channelCfg.Name, channelCfg.ID, minUpdatePeriod) // Removed success log
 			go m.autoUpdateMPD(channelCfg, entry, minUpdatePeriod)
 		} else if errMUP != nil {
-			log.Printf("GetMPD: Channel %s (%s) is dynamic but error getting MinimumUpdatePeriod: %v. No auto-update.", channelCfg.Name, channelCfg.ID, errMUP)
-		} else {
-			// log.Printf("GetMPD: Channel %s (%s) is dynamic but MinimumUpdatePeriod is zero or not set (%s). No auto-update.", channelCfg.Name, channelCfg.ID, minUpdatePeriod) // Potentially useful, but can be verbose
+			m.Logger.Warn("Channel is dynamic but error getting MinimumUpdatePeriod. No auto-update.", "channel_name", channelCfg.Name, "channel_id", channelCfg.ID, "error", errMUP)
 		}
 	}
 
 	dataCopy := *newMPDData
-	// log.Printf("GetMPD: Returning new MPD for channel %s (%s). FinalMPDURL: %s", channelCfg.Name, channelCfg.ID, newFinalURL) // Removed success log
 
 	// Precompute data and generate HLS playlists
 	// This needs to be done after entry.Data and entry.FinalMPDURL are set.
-	errPrecompute := precomputeMPDData(entry) // Pass the whole entry
+	// Pass the whole entry
+	errPrecompute := m.precomputeMPDData(entry)
 	if errPrecompute != nil {
-		log.Printf("GetMPD: Error precomputing MPD data for channel %s (%s): %v", channelCfg.ID, channelCfg.Name, errPrecompute)
+		m.Logger.Error("Error precomputing MPD data", "channel_id", channelCfg.ID, "channel_name", channelCfg.Name, "error", errPrecompute)
 		// Decide if this is a fatal error for GetMPD. For now, log and continue.
 		// The playlists might be empty or incomplete if precomputation fails partially.
 	}
 
 	masterPl, errMaster := generateMasterPlaylist(entry.Data, channelCfg.ID)
 	if errMaster != nil {
-		log.Printf("GetMPD: Error generating master playlist for channel %s (%s): %v", channelCfg.ID, channelCfg.Name, errMaster)
+		m.Logger.Error("Error generating master playlist", "channel_id", channelCfg.ID, "channel_name", channelCfg.Name, "error", errMaster)
 	} else {
 		entry.MasterPlaylist = masterPl
 	}
 
-	mediaPls, errMedia := generateMediaPlaylists(entry.Data, entry.FinalMPDURL, channelCfg.ID, entry.HLSBaseMediaSequence, channelCfg.ParsedKey)
+	mediaPls, segmentsToPreload, errMedia := m.generateMediaPlaylists(entry.Data, entry.FinalMPDURL, channelCfg.ID, entry.HLSBaseMediaSequence, channelCfg.ParsedKey)
 	if errMedia != nil {
-		log.Printf("GetMPD: Error generating media playlists for channel %s (%s): %v", channelCfg.ID, channelCfg.Name, errMedia)
+		m.Logger.Error("Error generating media playlists", "channel_id", channelCfg.ID, "error", errMedia)
 	} else {
 		entry.MediaPlaylists = mediaPls
+		// 通知预加载器更新 SEGMENT 列表
+		if m.Preloader != nil {
+			m.Preloader.UpdateSegmentsToPreload(channelCfg.ID, segmentsToPreload)
+		}
 	}
 
 	return newFinalURL, &dataCopy, nil
@@ -260,7 +492,7 @@ func (m *MPDManager) GetMPD(channelCfg *config.ChannelConfig) (string, *mpd.MPD,
 
 // precomputeMPDData populates the PrecomputedData map in CachedMPD.
 // This function should be called when entry.Mux is WLock'd and entry.Data is populated.
-func precomputeMPDData(cachedEntry *CachedMPD) error {
+func (m *MPDManager) precomputeMPDData(cachedEntry *CachedMPD) error {
 	if cachedEntry.Data == nil {
 		return fmt.Errorf("MPD data is nil, cannot precompute")
 	}
@@ -284,7 +516,7 @@ func precomputeMPDData(cachedEntry *CachedMPD) error {
 			if errParsePBase == nil {
 				currentPeriodBase = currentPeriodBase.ResolveReference(periodLevelBase)
 			} else {
-				log.Printf("precomputeMPDData: Error parsing Period BaseURL '%s': %v. Using parent base '%s'.", p.BaseURLs[0], errParsePBase, currentPeriodBase.String())
+				m.Logger.Warn("Error parsing Period BaseURL. Using parent base.", "base_url", p.BaseURLs[0], "parent_base", currentPeriodBase.String(), "error", errParsePBase)
 			}
 		}
 
@@ -296,10 +528,11 @@ func precomputeMPDData(cachedEntry *CachedMPD) error {
 				streamTypeKey = "video"
 			} else if as.ContentType == "audio" || strings.Contains(as.MimeType, "audio") {
 				streamTypeKey = "audio"
-			} else if as.ContentType == "text" || strings.Contains(as.MimeType, "text") || strings.Contains(as.MimeType, "application/mp4") { // Add more subtitle mimetypes if necessary, include application/mp4 for STPP
+			} else if as.ContentType == "text" || strings.Contains(as.MimeType, "text") || strings.Contains(as.MimeType, "application/ttml+xml") || (strings.Contains(as.MimeType, "application/mp4") && len(as.Representations) > 0 && strings.Contains(as.Representations[0].Codecs, "wvtt")) {
 				streamTypeKey = "subtitles"
 			} else {
-				continue // Skip unknown content types
+				// Skip unknown content types
+				continue
 			}
 
 			if _, ok := newPrecomputedData[streamTypeKey]; !ok {
@@ -313,22 +546,27 @@ func precomputeMPDData(cachedEntry *CachedMPD) error {
 				switch streamTypeKey {
 				case "video":
 					qualityOrLangKey = rep.ID
-					if qualityOrLangKey == "" { // Fallback if RepresentationID is empty
-						qualityOrLangKey = fmt.Sprintf("video_rep%d_as%d_p%d", k, j, i) // More unique fallback
+					// Fallback if RepresentationID is empty
+					if qualityOrLangKey == "" {
+						// More unique fallback
+						qualityOrLangKey = fmt.Sprintf("video_rep%d_as%d_p%d", k, j, i)
 					}
 				case "audio":
 					qualityOrLangKey = as.Lang
 					if qualityOrLangKey == "" {
-						qualityOrLangKey = fmt.Sprintf("audio_default%d_as%d_p%d", k, j, i) // More unique fallback
+						// More unique fallback
+						qualityOrLangKey = fmt.Sprintf("audio_default%d_as%d_p%d", k, j, i)
 					}
 				case "subtitles":
 					qualityOrLangKey = as.Lang
 					if qualityOrLangKey == "" {
-						qualityOrLangKey = fmt.Sprintf("sub_default%d_as%d_p%d", k, j, i) // More unique fallback
+						// More unique fallback
+						qualityOrLangKey = fmt.Sprintf("sub_default%d_as%d_p%d", k, j, i)
 					}
 				}
-				if qualityOrLangKey == "" { // Should be rare with fallbacks
-					log.Printf("precomputeMPDData: qualityOrLangKey is empty for stream %s, AS ID %s, Rep ID %s. Skipping.", streamTypeKey, as.ID, rep.ID)
+				// Should be rare with fallbacks
+				if qualityOrLangKey == "" {
+					m.Logger.Warn("qualityOrLangKey is empty. Skipping.", "stream_type", streamTypeKey, "as_id", as.ID, "rep_id", rep.ID)
 					continue
 				}
 
@@ -341,7 +579,7 @@ func precomputeMPDData(cachedEntry *CachedMPD) error {
 							asBase = resolved
 						}
 					} else {
-						log.Printf("precomputeMPDData: Error parsing AS.BaseURL ('%s'): %v. Using Period base '%s'.", as.BaseURL, errParseASBase, asBase.String())
+						m.Logger.Warn("Error parsing AS.BaseURL. Using Period base.", "as_base_url", as.BaseURL, "period_base", asBase.String(), "error", errParseASBase)
 					}
 				}
 
@@ -358,8 +596,9 @@ func precomputeMPDData(cachedEntry *CachedMPD) error {
 					segTemplate = as.SegmentTemplate
 				}
 
-				if segTemplate == nil { // Still no template, skip
-					log.Printf("precomputeMPDData: No segment template found for stream %s, quality/lang %s. Skipping.", streamTypeKey, qualityOrLangKey)
+				// Still no template, skip
+				if segTemplate == nil {
+					m.Logger.Warn("No segment template found for stream. Skipping.", "stream_type", streamTypeKey, "quality_or_lang", qualityOrLangKey)
 					continue
 				}
 
@@ -374,15 +613,12 @@ func precomputeMPDData(cachedEntry *CachedMPD) error {
 		}
 	}
 	cachedEntry.PrecomputedData = newPrecomputedData
-	// log.Printf("Precomputed data generated for channel %s. Video entries: %d, Audio entries: %d, Subtitle entries: %d", cachedEntry.Data.ID, len(newPrecomputedData["video"]), len(newPrecomputedData["audio"]), len(newPrecomputedData["subtitles"]))
 	return nil
 }
 
 func (m *MPDManager) autoUpdateMPD(channelCfg *config.ChannelConfig, cachedEntry *CachedMPD, initialMinUpdatePeriod time.Duration) {
 	ticker := time.NewTicker(initialMinUpdatePeriod)
 	defer ticker.Stop()
-
-	// log.Printf("AutoUpdater started for channel %s (%s). Update interval: %s", channelCfg.Name, channelCfg.ID, initialMinUpdatePeriod) // Removed success log
 
 	for {
 		select {
@@ -391,59 +627,68 @@ func (m *MPDManager) autoUpdateMPD(channelCfg *config.ChannelConfig, cachedEntry
 			var lastAccessed time.Time
 			var currentFinalMPDURL string
 			var currentPublishTime time.Time
-			var knownInitialBaseURL string // For BaseURL consistency check
-			var isInitialBaseURLSet bool   // For BaseURL consistency check
+			// For BaseURL consistency check
+			var knownInitialBaseURL string
+			// For BaseURL consistency check
+			var isInitialBaseURLSet bool
 
 			cachedEntry.Mux.RLock()
-			if cachedEntry.Data == nil { // Should not happen if auto-updater is running
-				log.Printf("AutoUpdater [%s]: Cached MPD data is nil. Stopping.", channelCfg.ID)
+			// Should not happen if auto-updater is running
+			if cachedEntry.Data == nil {
+				m.Logger.Error("AutoUpdater: Cached MPD data is nil. Stopping.", "channel_id", channelCfg.ID)
 				cachedEntry.Mux.RUnlock()
 				return
 			}
 			var mupErr error
 			currentMinUpdatePeriodDuration, mupErr = cachedEntry.Data.GetMinimumUpdatePeriod()
 			if mupErr != nil {
-				log.Printf("AutoUpdater [%s]: Error getting current MinimumUpdatePeriod from cached MPD: %v. Stopping.", channelCfg.ID, mupErr)
+				m.Logger.Error("AutoUpdater: Error getting current MinimumUpdatePeriod from cached MPD. Stopping.", "channel_id", channelCfg.ID, "error", mupErr)
 				cachedEntry.Mux.RUnlock()
 				return
 			}
 			lastAccessed = cachedEntry.LastAccessedAt
 			currentFinalMPDURL = cachedEntry.FinalMPDURL
-			currentPublishTime = cachedEntry.LastMPDPublishTime // Use our stored LastMPDPublishTime
+			// Use our stored LastMPDPublishTime
+			currentPublishTime = cachedEntry.LastMPDPublishTime
 			knownInitialBaseURL = cachedEntry.InitialBaseURL
 			isInitialBaseURLSet = cachedEntry.InitialBaseURLIsSet
 			cachedEntry.Mux.RUnlock()
 
 			// Stop auto-update if channel is inactive for 5 times the initial minimum update period.
 			inactivityTimeout := 5 * initialMinUpdatePeriod
-			if inactivityTimeout <= 0 { // Safety fallback, as initialMinUpdatePeriod should be > 0 when autoUpdateMPD is called
-				inactivityTimeout = 5 * 10 * time.Minute // e.g., 50 minutes if MUP was unexpectedly zero or negative
+			// Safety fallback, as initialMinUpdatePeriod should be > 0 when autoUpdateMPD is called
+			if inactivityTimeout <= 0 {
+				// e.g., 50 minutes if MUP was unexpectedly zero or negative
+				inactivityTimeout = 5 * 10 * time.Minute
 			}
 
 			if time.Since(lastAccessed) > inactivityTimeout {
-				log.Printf("AutoUpdater [%s]: Channel inactive for over %s (last access: %s, 5x initial MUP: %s). Stopping auto-updater and clearing cache.",
-					channelCfg.ID, inactivityTimeout, lastAccessed.Format(time.RFC3339), initialMinUpdatePeriod)
+				m.Logger.Info("AutoUpdater: Channel inactive. Stopping auto-updater and clearing cache.",
+					"channel_id", channelCfg.ID,
+					"inactivity_timeout", inactivityTimeout,
+					"last_access", lastAccessed.Format(time.RFC3339),
+					"initial_mup", initialMinUpdatePeriod)
 
 				m.CacheLock.Lock()
 				delete(m.MPDCache, channelCfg.ID)
 				m.CacheLock.Unlock()
-				log.Printf("AutoUpdater [%s]: Cache cleared due to inactivity.", channelCfg.ID)
+				m.Logger.Info("AutoUpdater: Cache cleared due to inactivity.", "channel_id", channelCfg.ID)
 				return
 			}
 
 			urlToFetch := currentFinalMPDURL
-			if urlToFetch == "" { // Fallback to initial manifest if final URL somehow became empty
+			// Fallback to initial manifest if final URL somehow became empty
+			if urlToFetch == "" {
 				urlToFetch = channelCfg.Manifest
-				log.Printf("AutoUpdater [%s]: FinalMPDURL was empty, falling back to initial manifest URL: %s", channelCfg.ID, urlToFetch) // Keep this, it's a recovery action
+				m.Logger.Warn("AutoUpdater: FinalMPDURL was empty, falling back to initial manifest URL", "channel_id", channelCfg.ID, "url", urlToFetch)
 			}
 			if urlToFetch == "" {
-				log.Printf("AutoUpdater [%s]: No URL to fetch MPD from. Skipping update.", channelCfg.ID) // Keep this, it's a skip condition
+				m.Logger.Warn("AutoUpdater: No URL to fetch MPD from. Skipping update.", "channel_id", channelCfg.ID)
 				continue
 			}
 
-			// log.Printf("AutoUpdater [%s]: Time to refresh MPD. Will fetch from %s", channelCfg.ID, urlToFetch) // Removed success log
-
-			newFinalURL, newMPDData, _, err := fetchMPDWithBaseURLRetry( // Assign fetchedBaseURL to _
+			// Assign fetchedBaseURL to _
+			newFinalURL, newMPDData, _, err := m.fetchMPDWithBaseURLRetry(
 				urlToFetch,
 				channelCfg.UserAgent,
 				channelCfg.ID,
@@ -455,17 +700,15 @@ func (m *MPDManager) autoUpdateMPD(channelCfg *config.ChannelConfig, cachedEntry
 			)
 
 			if err != nil {
-				log.Printf("AutoUpdater [%s]: Error fetching/retrying MPD from %s: %v. Will retry on next tick.", channelCfg.ID, urlToFetch, err)
+				m.Logger.Error("AutoUpdater: Error fetching/retrying MPD. Will retry on next tick.", "channel_id", channelCfg.ID, "url", urlToFetch, "error", err)
 				continue
 			}
 			if newMPDData == nil {
-				log.Printf("AutoUpdater [%s]: Failed to obtain MPD data after retries from %s. Will retry on next tick.", channelCfg.ID, urlToFetch)
+				m.Logger.Error("AutoUpdater: Failed to obtain MPD data after retries. Will retry on next tick.", "channel_id", channelCfg.ID, "url", urlToFetch)
 				continue
 			}
 
 			cachedEntry.Mux.Lock()
-			// log.Printf("AutoUpdater [%s]: Successfully processed MPD. Updating cache. New FinalMPDURL: %s, New PublishTime: %s", // Removed success log, also removed fetchedBaseURL from here
-			//	channelCfg.ID, newFinalURL, newMPDData.PublishTime)
 
 			entryDataChanged := false
 			newPt, ptErr := time.Parse(time.RFC3339, newMPDData.PublishTime)
@@ -478,11 +721,9 @@ func (m *MPDManager) autoUpdateMPD(channelCfg *config.ChannelConfig, cachedEntry
 					entryDataChanged = true
 					cachedEntry.HLSBaseMediaSequence++
 					cachedEntry.LastMPDPublishTime = newPt
-					// log.Printf("AutoUpdater [%s]: PublishTime changed. Old: %s, New: %s. Incremented HLSBaseMediaSequence to %d.", // Removed success log
-					//	channelCfg.ID, currentPublishTime.Format(time.RFC3339), newPt.Format(time.RFC3339), cachedEntry.HLSBaseMediaSequence)
 				}
 			} else {
-				log.Printf("AutoUpdater [%s]: Warning - could not parse new PublishTime '%s': %v", channelCfg.ID, newMPDData.PublishTime, ptErr) // Keep warning
+				m.Logger.Warn("AutoUpdater: Could not parse new PublishTime", "channel_id", channelCfg.ID, "publish_time", newMPDData.PublishTime, "error", ptErr)
 			}
 
 			cachedEntry.Data = newMPDData
@@ -491,51 +732,51 @@ func (m *MPDManager) autoUpdateMPD(channelCfg *config.ChannelConfig, cachedEntry
 
 			newMinUpdatePeriod, newMupErr := newMPDData.GetMinimumUpdatePeriod()
 			if newMupErr == nil && newMinUpdatePeriod > 0 && newMinUpdatePeriod != currentMinUpdatePeriodDuration {
-				// log.Printf("AutoUpdater [%s]: MinimumUpdatePeriod changed from %s to %s. Adjusting ticker.", // Informational
-				//	channelCfg.ID, currentMinUpdatePeriodDuration, newMinUpdatePeriod)
 				ticker.Reset(newMinUpdatePeriod)
 				initialMinUpdatePeriod = newMinUpdatePeriod
 			} else if newMupErr != nil {
-				log.Printf("AutoUpdater [%s]: Error parsing new MinimumUpdatePeriod '%s': %v. Keeping current ticker interval %s.", // Keep error
-					channelCfg.ID, newMPDData.MinimumUpdatePeriod, newMupErr, currentMinUpdatePeriodDuration)
+				m.Logger.Warn("AutoUpdater: Error parsing new MinimumUpdatePeriod. Keeping current ticker interval.", "channel_id", channelCfg.ID, "mup", newMPDData.MinimumUpdatePeriod, "error", newMupErr, "current_interval", currentMinUpdatePeriodDuration)
 			}
 			if entryDataChanged {
-				// log.Printf("AutoUpdater [%s]: MPD data and HLS sequence have been updated.", channelCfg.ID) // Removed success log
 				// Regenerate HLS playlists and precompute data as MPD data or sequence number changed
-				errPrecompute := precomputeMPDData(cachedEntry)
+				errPrecompute := m.precomputeMPDData(cachedEntry)
 				if errPrecompute != nil {
-					log.Printf("AutoUpdater [%s]: Error precomputing MPD data: %v", channelCfg.ID, errPrecompute)
+					m.Logger.Error("AutoUpdater: Error precomputing MPD data", "channel_id", channelCfg.ID, "error", errPrecompute)
 				}
 
 				masterPl, errMaster := generateMasterPlaylist(cachedEntry.Data, channelCfg.ID)
 				if errMaster != nil {
-					log.Printf("AutoUpdater [%s]: Error generating master playlist: %v", channelCfg.ID, errMaster)
+					m.Logger.Error("AutoUpdater: Error generating master playlist", "channel_id", channelCfg.ID, "error", errMaster)
 				} else {
 					cachedEntry.MasterPlaylist = masterPl
 				}
 
-				mediaPls, errMedia := generateMediaPlaylists(cachedEntry.Data, cachedEntry.FinalMPDURL, channelCfg.ID, cachedEntry.HLSBaseMediaSequence, channelCfg.ParsedKey)
+				mediaPls, segmentsToPreload, errMedia := m.generateMediaPlaylists(cachedEntry.Data, cachedEntry.FinalMPDURL, channelCfg.ID, cachedEntry.HLSBaseMediaSequence, channelCfg.ParsedKey)
 				if errMedia != nil {
-					log.Printf("AutoUpdater [%s]: Error generating media playlists: %v", channelCfg.ID, errMedia)
+					m.Logger.Error("AutoUpdater: Error generating media playlists", "channel_id", channelCfg.ID, "error", errMedia)
 				} else {
 					cachedEntry.MediaPlaylists = mediaPls
+					// 通知预加载器更新 SEGMENT 列表
+					if m.Preloader != nil {
+						m.Preloader.UpdateSegmentsToPreload(channelCfg.ID, segmentsToPreload)
+					}
 				}
-				// log.Printf("AutoUpdater [%s]: HLS playlists and precomputed data regenerated.", channelCfg.ID) // Removed success log
-			} else {
-				// log.Printf("AutoUpdater [%s]: MPD data fetched, but no publish time change detected (Old: %s, New: %s). HLS sequence not incremented.", // Informational, but verbose
-				//	channelCfg.ID, currentPublishTime.Format(time.RFC3339), newMPDData.PublishTime)
 			}
 			cachedEntry.Mux.Unlock()
 
 		case <-cachedEntry.stopAutoUpdateCh:
-			// log.Printf("AutoUpdater [%s]: Received stop signal. Shutting down.", channelCfg.ID) // Informational
+			// 通知预加载器停止预加载该频道的 SEGMENT
+			if m.Preloader != nil {
+				// 传入空 map 清理
+				m.Preloader.UpdateSegmentsToPreload(channelCfg.ID, map[string]string{})
+			}
 			return
 		}
 	}
 }
 
 // fetchMPDWithBaseURLRetry fetches an MPD and retries if the BaseURL does not match a known initial BaseURL.
-func fetchMPDWithBaseURLRetry(
+func (m *MPDManager) fetchMPDWithBaseURLRetry(
 	initialFetchURL string,
 	userAgent string,
 	channelID string,
@@ -545,10 +786,6 @@ func fetchMPDWithBaseURLRetry(
 	maxRetries int,
 	retryDelay time.Duration,
 ) (finalURL string, mpdObj *mpd.MPD, actualBaseURL string, err error) {
-
-	// log.Printf("fetchMPDWithBaseURLRetry: Fetching for channel %s (%s) from %s. Expecting BaseURL: '%s' (isSet: %t)", // Removed success log
-	//	channelID, channelName, initialFetchURL, knownInitialBaseURL, isInitialBaseURLSet)
-
 	fetchedFinalURL, fetchedMPDObj, fetchErr := mpd.FetchAndParseMPD(initialFetchURL, userAgent)
 	if fetchErr != nil {
 		return initialFetchURL, nil, "", fmt.Errorf("initial fetch failed: %w", fetchErr)
@@ -560,39 +797,33 @@ func fetchMPDWithBaseURLRetry(
 	}
 
 	if !isInitialBaseURLSet {
-		// log.Printf("fetchMPDWithBaseURLRetry: Initial BaseURL for channel %s (%s) determined as: '%s' from URL %s (final: %s)", // Removed success log
-		//	channelID, channelName, currentActualBaseURL, initialFetchURL, fetchedFinalURL)
 		return fetchedFinalURL, fetchedMPDObj, currentActualBaseURL, nil
 	}
 
 	if currentActualBaseURL == knownInitialBaseURL {
-		// log.Printf("fetchMPDWithBaseURLRetry: BaseURL for channel %s (%s) matches expected: '%s'. URL: %s (final: %s)", // Removed success log
-		//	channelID, channelName, knownInitialBaseURL, initialFetchURL, fetchedFinalURL)
 		return fetchedFinalURL, fetchedMPDObj, currentActualBaseURL, nil
 	}
 
-	log.Printf("fetchMPDWithBaseURLRetry: BaseURL mismatch for channel %s (%s). Expected: '%s', Got: '%s'. URL: %s (final: %s). Attempting retries...", // Keep this, it's a key event before retries
-		channelID, channelName, knownInitialBaseURL, currentActualBaseURL, initialFetchURL, fetchedFinalURL)
+	m.Logger.Warn("BaseURL mismatch. Attempting retries...",
+		"channel_id", channelID,
+		"channel_name", channelName,
+		"expected_base_url", knownInitialBaseURL,
+		"got_base_url", currentActualBaseURL,
+		"url", initialFetchURL,
+		"final_url", fetchedFinalURL)
 
 	lastGoodMPD := fetchedMPDObj
 	lastGoodFinalURL := fetchedFinalURL
 	lastGoodActualBaseURL := currentActualBaseURL
 
 	for i := 0; i < maxRetries; i++ {
-		// log.Printf("fetchMPDWithBaseURLRetry: Retry %d/%d for BaseURL mismatch on channel %s (%s). Delaying %s...", // Informational
-		//	i+1, maxRetries, channelID, channelName, retryDelay)
 		time.Sleep(retryDelay)
-
-		// log.Printf("fetchMPDWithBaseURLRetry: Retry %d/%d, fetching from %s for channel %s (%s)", // Informational
-		//	i+1, maxRetries, initialFetchURL, channelID, channelName)
 
 		retryFinalURL, retryMPDData, retryErr := mpd.FetchAndParseMPD(initialFetchURL, userAgent)
 		if retryErr != nil {
-			log.Printf("fetchMPDWithBaseURLRetry: Retry %d/%d fetch failed for channel %s (%s): %v", // Keep error
-				i+1, maxRetries, channelID, channelName, retryErr)
+			m.Logger.Error("Retry fetch failed", "retry_attempt", i+1, "max_retries", maxRetries, "channel_id", channelID, "error", retryErr)
 			if i == maxRetries-1 {
-				log.Printf("fetchMPDWithBaseURLRetry: Max retries reached, last retry fetch failed for channel %s (%s). Returning MPD from initial attempt (BaseURL: '%s').", // Keep info on returning old data
-					channelID, channelName, lastGoodActualBaseURL)
+				m.Logger.Error("Max retries reached, last retry fetch failed. Returning MPD from initial attempt.", "channel_id", channelID, "initial_base_url", lastGoodActualBaseURL)
 				return lastGoodFinalURL, lastGoodMPD, lastGoodActualBaseURL, nil
 			}
 			continue
@@ -604,8 +835,6 @@ func fetchMPDWithBaseURLRetry(
 		}
 
 		if retryAttemptBaseURL == knownInitialBaseURL {
-			// log.Printf("fetchMPDWithBaseURLRetry: Retry %d/%d successful. BaseURL for channel %s (%s) now matches: '%s'. Final URL: %s", // Removed success log
-			//	i+1, maxRetries, channelID, channelName, knownInitialBaseURL, retryFinalURL)
 			return retryFinalURL, retryMPDData, retryAttemptBaseURL, nil
 		}
 
@@ -613,18 +842,21 @@ func fetchMPDWithBaseURLRetry(
 		lastGoodFinalURL = retryFinalURL
 		lastGoodActualBaseURL = retryAttemptBaseURL
 
-		log.Printf("fetchMPDWithBaseURLRetry: Retry %d/%d BaseURL still mismatch for channel %s (%s). Expected: '%s', Got: '%s'. Final URL: %s", // Keep info on persistent mismatch
-			i+1, maxRetries, channelID, channelName, knownInitialBaseURL, retryAttemptBaseURL, retryFinalURL)
+		m.Logger.Warn("Retry BaseURL still mismatch",
+			"retry_attempt", i+1,
+			"max_retries", maxRetries,
+			"channel_id", channelID,
+			"expected_base_url", knownInitialBaseURL,
+			"got_base_url", retryAttemptBaseURL,
+			"final_url", retryFinalURL)
 
 		if i == maxRetries-1 {
-			log.Printf("fetchMPDWithBaseURLRetry: Max retries reached, BaseURL still mismatch for channel %s (%s). Proceeding with this last fetched MPD (BaseURL: '%s').", // Keep info on proceeding with mismatched data
-				channelID, channelName, retryAttemptBaseURL)
+			m.Logger.Warn("Max retries reached, BaseURL still mismatch. Proceeding with this last fetched MPD.", "channel_id", channelID, "base_url", retryAttemptBaseURL)
 			return retryFinalURL, retryMPDData, retryAttemptBaseURL, nil
 		}
 	}
 	// This log indicates an unexpected state, so it should be kept.
-	log.Printf("fetchMPDWithBaseURLRetry: Exited retry loop unexpectedly for channel %s (%s). Returning last known good MPD (BaseURL: '%s').",
-		channelID, channelName, lastGoodActualBaseURL)
+	m.Logger.Error("Exited retry loop unexpectedly. Returning last known good MPD.", "channel_id", channelID, "base_url", lastGoodActualBaseURL)
 	return lastGoodFinalURL, lastGoodMPD, lastGoodActualBaseURL, nil
 }
 
@@ -632,7 +864,8 @@ func fetchMPDWithBaseURLRetry(
 func generateMasterPlaylist(mpdData *mpd.MPD, channelID string) (string, error) {
 	var playlist bytes.Buffer
 	playlist.WriteString("#EXTM3U\n")
-	playlist.WriteString("#EXT-X-VERSION:7\n") // Using a higher version for more features if needed
+	// Using a higher version for more features if needed
+	playlist.WriteString("#EXT-X-VERSION:7\n")
 
 	audioGroupID := "audio_grp"
 	subtitleGroupID := "subs_grp"
@@ -652,8 +885,9 @@ func generateMasterPlaylist(mpdData *mpd.MPD, channelID string) (string, error) 
 					}
 
 					lang := as.Lang
+					// Default lang if not specified
 					if lang == "" {
-						lang = fmt.Sprintf("audio%d", audioStreamIndex) // Default lang if not specified
+						lang = fmt.Sprintf("audio%d", audioStreamIndex)
 					}
 					name := lang
 					// Attempt to get a more descriptive name if available
@@ -665,7 +899,8 @@ func generateMasterPlaylist(mpdData *mpd.MPD, channelID string) (string, error) 
 					}
 
 					isDefault := "NO"
-					if audioStreamIndex == 0 { // Make the first audio track default
+					// Make the first audio track default
+					if audioStreamIndex == 0 {
 						isDefault = "YES"
 					}
 
@@ -692,7 +927,7 @@ func generateMasterPlaylist(mpdData *mpd.MPD, channelID string) (string, error) 
 			if as.ContentType == "text" ||
 				strings.Contains(as.MimeType, "text") ||
 				strings.Contains(as.MimeType, "application/ttml+xml") ||
-				(strings.Contains(as.MimeType, "application/mp4") && (strings.Contains(as.Representations[0].Codecs, "wvtt") || strings.Contains(as.Representations[0].Codecs, "stpp"))) {
+				(strings.Contains(as.MimeType, "application/mp4") && len(as.Representations) > 0 && strings.Contains(as.Representations[0].Codecs, "wvtt")) {
 				if len(as.Representations) > 0 {
 					lang := as.Lang
 					if lang == "" {
@@ -705,7 +940,8 @@ func generateMasterPlaylist(mpdData *mpd.MPD, channelID string) (string, error) 
 					} else {
 						name = fmt.Sprintf("Subtitles %d", subtitleStreamIndex+1)
 					}
-					isDefault := "NO" // Subtitles usually not default unless only option or accessibility requirement
+					// Subtitles usually not default unless only option or accessibility requirement
+					isDefault := "NO"
 
 					mediaPlaylistPath := fmt.Sprintf("/hls/%s/subtitles/%s/playlist.m3u8", channelID, lang)
 					playlist.WriteString(fmt.Sprintf("#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"%s\",NAME=\"%s\",LANGUAGE=\"%s\",AUTOSELECT=YES,DEFAULT=%s,URI=\"%s\"\n",
@@ -727,10 +963,12 @@ func generateMasterPlaylist(mpdData *mpd.MPD, channelID string) (string, error) 
 
 				// Find the representation with the highest bandwidth in this AdaptationSet
 				var bestRep *mpd.Representation = nil
-				var maxBandwidth uint // Changed to uint to match rep.Bandwidth
+				// Changed to uint to match rep.Bandwidth
+				var maxBandwidth uint
 
 				for i := range as.Representations {
-					rep := &as.Representations[i] // Use pointer to avoid copying
+					// Use pointer to avoid copying
+					rep := &as.Representations[i]
 					if rep.Bandwidth > maxBandwidth {
 						maxBandwidth = rep.Bandwidth
 						bestRep = rep
@@ -738,13 +976,16 @@ func generateMasterPlaylist(mpdData *mpd.MPD, channelID string) (string, error) 
 				}
 
 				if bestRep != nil {
-					rep := bestRep // Use the best representation found
+					// Use the best representation found
+					rep := bestRep
 					var streamInf strings.Builder
-					streamInf.WriteString("#EXT-X-STREAM-INF:PROGRAM-ID=1") // PROGRAM-ID is optional but common
+					// PROGRAM-ID is optional but common
+					streamInf.WriteString("#EXT-X-STREAM-INF:PROGRAM-ID=1")
 
 					if rep.Bandwidth > 0 {
 						streamInf.WriteString(fmt.Sprintf(",BANDWIDTH=%d", rep.Bandwidth))
-						streamInf.WriteString(fmt.Sprintf(",AVERAGE-BANDWIDTH=%d", rep.Bandwidth)) // AVERAGE-BANDWIDTH is optional
+						// AVERAGE-BANDWIDTH is optional
+						streamInf.WriteString(fmt.Sprintf(",AVERAGE-BANDWIDTH=%d", rep.Bandwidth))
 					}
 					if rep.Width > 0 && rep.Height > 0 {
 						streamInf.WriteString(fmt.Sprintf(",RESOLUTION=%dx%d", rep.Width, rep.Height))
@@ -778,17 +1019,29 @@ func generateMasterPlaylist(mpdData *mpd.MPD, channelID string) (string, error) 
 }
 
 // generateMediaPlaylists generates all HLS media playlist strings.
-func generateMediaPlaylists(mpdData *mpd.MPD, finalMPDURLStr string, channelID string, hlsBaseMediaSequence uint64, parsedKey []byte) (map[string]string, error) {
+// It also returns a map of segment keys to their upstream URLs for preloading.
+func (m *MPDManager) generateMediaPlaylists(mpdData *mpd.MPD, finalMPDURLStr string, channelID string, hlsBaseMediaSequence uint64, parsedKey []byte) (map[string]string, map[string]string, error) {
 	playlists := make(map[string]string)
-	// mpdBaseURL, err := url.Parse(finalMPDURLStr) // mpdBaseURL is not directly used for generating proxy-relative HLS URLs.
-	// if err != nil {
-	// 	log.Printf("generateMediaPlaylists: Error parsing finalMPDURLStr '%s': %v", finalMPDURLStr, err)
-	// }
+	// New map to return segment URLs for preloading
+	segmentsToPreload := make(map[string]string)
+
+	finalMPDURL, errParseMPDURL := url.Parse(finalMPDURLStr)
+	if errParseMPDURL != nil {
+		m.Logger.Error("Error parsing finalMPDURLStr", "url", finalMPDURLStr, "error", errParseMPDURL)
+		return playlists, segmentsToPreload, fmt.Errorf("error parsing final MPD URL: %w", errParseMPDURL)
+	}
 
 	for _, period := range mpdData.Periods {
-		// Note: BaseURL resolution logic from segmentProxyHandler can be complex with multiple levels.
-		// For playlist generation, we are creating HLS-proxy-relative URLs.
-		// The `finalMPDURLStr` is mainly for context if needed, but segment URLs in HLS will be like /hls/...
+		currentPeriodBase := finalMPDURL
+
+		if len(period.BaseURLs) > 0 && period.BaseURLs[0] != "" {
+			periodLevelBase, errParsePBase := url.Parse(period.BaseURLs[0])
+			if errParsePBase == nil {
+				currentPeriodBase = currentPeriodBase.ResolveReference(periodLevelBase)
+			} else {
+				m.Logger.Warn("Error parsing Period BaseURL. Using parent base.", "base_url", period.BaseURLs[0], "parent_base", currentPeriodBase.String(), "error", errParsePBase)
+			}
+		}
 
 		for _, as := range period.AdaptationSets {
 			var streamType string
@@ -796,52 +1049,50 @@ func generateMediaPlaylists(mpdData *mpd.MPD, finalMPDURLStr string, channelID s
 				streamType = "video"
 			} else if as.ContentType == "audio" || strings.Contains(as.MimeType, "audio") {
 				streamType = "audio"
-				// Adjusted condition to correctly identify subtitle tracks for media playlist generation
 			} else if as.ContentType == "text" ||
 				strings.Contains(as.MimeType, "text") ||
 				strings.Contains(as.MimeType, "application/ttml+xml") ||
-				(strings.Contains(as.MimeType, "application/mp4") && len(as.Representations) > 0 && (strings.Contains(as.Representations[0].Codecs, "wvtt") || strings.Contains(as.Representations[0].Codecs, "stpp"))) {
+				(strings.Contains(as.MimeType, "application/mp4") && len(as.Representations) > 0 && strings.Contains(as.Representations[0].Codecs, "wvtt")) {
 				streamType = "subtitles"
 			} else {
-				continue // Skip unknown content types
+				// Skip unknown content types
+				continue
 			}
 
 			for i, rep := range as.Representations {
-				// Determine the quality/language identifier for the HLS URL and map key
 				var qualityOrLangKey string
 				if streamType == "video" {
 					qualityOrLangKey = rep.ID
-					if qualityOrLangKey == "" { // Fallback if RepresentationID is empty
+					if qualityOrLangKey == "" {
 						qualityOrLangKey = fmt.Sprintf("video_rep%d", i)
 					}
-				} else { // Audio or Subtitles
+				} else {
 					qualityOrLangKey = as.Lang
-					if qualityOrLangKey == "" { // Fallback if lang is empty
+					if qualityOrLangKey == "" {
 						if streamType == "audio" {
-							qualityOrLangKey = fmt.Sprintf("audio%d", adaptacionSetAudioIndex(mpdData, &as))
+							qualityOrLangKey = fmt.Sprintf("audio%d", adaptationSetAudioIndex(mpdData, &as))
 						} else {
-							qualityOrLangKey = fmt.Sprintf("sub%d", adaptaciónSetSubtitleIndex(mpdData, &as))
+							qualityOrLangKey = fmt.Sprintf("sub%d", adaptationSetSubtitleIndex(mpdData, &as))
 						}
 					}
 				}
-				if qualityOrLangKey == "" { // Should not happen with fallbacks, but as a safeguard
-					log.Printf("Warning: Empty qualityOrLangKey for AS contentType %s, lang %s, repID %s. Skipping.", as.ContentType, as.Lang, rep.ID)
+				if qualityOrLangKey == "" {
+					m.Logger.Warn("Empty qualityOrLangKey. Skipping.", "content_type", as.ContentType, "lang", as.Lang, "rep_id", rep.ID)
 					continue
 				}
 
 				playlistKey := fmt.Sprintf("%s/%s", streamType, qualityOrLangKey)
 				var playlistBuf bytes.Buffer
 				playlistBuf.WriteString("#EXTM3U\n")
-				playlistBuf.WriteString("#EXT-X-VERSION:7\n") // Consistent with master
+				playlistBuf.WriteString("#EXT-X-VERSION:7\n")
 
-				// Determine SegmentTemplate (Representation or AdaptationSet level)
 				segTemplate := rep.SegmentTemplate
 				if segTemplate == nil {
 					segTemplate = as.SegmentTemplate
 				}
 
 				if segTemplate == nil || segTemplate.SegmentTimeline == nil || len(segTemplate.SegmentTimeline.Segments) == 0 {
-					log.Printf("generateMediaPlaylists: SegmentTemplate or SegmentTimeline missing/empty for %s in channel %s. Skipping playlist for key %s.", rep.ID, channelID, playlistKey)
+					m.Logger.Warn("SegmentTemplate or SegmentTimeline missing/empty. Skipping playlist.", "rep_id", rep.ID, "channel_id", channelID, "playlist_key", playlistKey)
 					continue
 				}
 
@@ -850,17 +1101,52 @@ func generateMediaPlaylists(mpdData *mpd.MPD, finalMPDURLStr string, channelID s
 					timescale = *segTemplate.Timescale
 				}
 				if timescale == 0 {
-					timescale = 1 // Avoid division by zero
+					timescale = 1
 				}
 
 				var maxSegDurSeconds float64 = 0
 				var allSegments []struct {
 					StartTime, Duration uint64
-					URL                 string
+					// HLS proxy URL
+					HLSURL string
+					// Original upstream URL
+					UpstreamURL string
 				}
 				currentStartTime := uint64(0)
 				if len(segTemplate.SegmentTimeline.Segments) > 0 && segTemplate.SegmentTimeline.Segments[0].T != nil {
 					currentStartTime = *segTemplate.SegmentTimeline.Segments[0].T
+				}
+
+				asBase := currentPeriodBase
+				if as.BaseURL != "" {
+					parsedASSpecificBase, errParseASBase := url.Parse(as.BaseURL)
+					if errParseASBase == nil {
+						resolved := asBase.ResolveReference(parsedASSpecificBase)
+						if resolved != nil {
+							asBase = resolved
+						}
+					} else {
+						m.Logger.Warn("Error parsing AS.BaseURL. Using Period base.", "as_base_url", as.BaseURL, "period_base", asBase.String(), "error", errParseASBase)
+					}
+				}
+
+				resolvedBaseURLStr := ""
+				if asBase != nil {
+					resolvedBaseURLStr = asBase.String()
+				}
+				if resolvedBaseURLStr != "" && !strings.HasSuffix(resolvedBaseURLStr, "/") {
+					resolvedBaseURLStr += "/"
+				}
+
+				// Handle Initialization Segment for preloading
+				if streamType != "subtitles" && segTemplate.Initialization != "" {
+					hlsInitSegmentName := "init.m4s"
+					hlsInitSegmentURL := fmt.Sprintf("/hls/%s/%s/%s/%s", channelID, streamType, qualityOrLangKey, hlsInitSegmentName)
+
+					initRelativePath := strings.ReplaceAll(segTemplate.Initialization, "$RepresentationID$", rep.ID)
+					upstreamInitURL := resolvedBaseURLStr + initRelativePath
+
+					segmentsToPreload[hlsInitSegmentURL] = upstreamInitURL
 				}
 
 				for _, s := range segTemplate.SegmentTimeline.Segments {
@@ -876,55 +1162,62 @@ func generateMediaPlaylists(mpdData *mpd.MPD, finalMPDURLStr string, channelID s
 						if segDurationSeconds > maxSegDurSeconds {
 							maxSegDurSeconds = segDurationSeconds
 						}
-						// HLS segment URL construction: /hls/<channelID>/<streamType>/<qualityOrLangKey>/<time_or_number>.[m4s|vtt]
-						// The actual segment name for HLS is derived from its start time or a sequence number.
-						// Using start time for now as it's directly available.
+
 						segmentIdentifierForHLS := strconv.FormatUint(currentStartTime, 10)
 						segmentFileExtension := ".m4s"
-						if streamType == "subtitles" && IsSTPPTrack(&as) { // Check if it's an STPP track
+						if streamType == "subtitles" && strings.Contains(as.MimeType, "application/ttml+xml") {
 							segmentFileExtension = ".vtt"
 						}
 						hlsSegmentURL := fmt.Sprintf("/hls/%s/%s/%s/%s%s", channelID, streamType, qualityOrLangKey, segmentIdentifierForHLS, segmentFileExtension)
 
+						// Construct upstream URL for the segment
+						mpdPathSegmentIdentifier := segmentIdentifierForHLS
+						tempPath := strings.ReplaceAll(segTemplate.Media, "$RepresentationID$", rep.ID)
+						var relativeSegmentPath string
+						if strings.Contains(tempPath, "$Time$") {
+							relativeSegmentPath = strings.ReplaceAll(tempPath, "$Time$", mpdPathSegmentIdentifier)
+						} else if strings.Contains(tempPath, "$Number$") {
+							relativeSegmentPath = strings.ReplaceAll(tempPath, "$Number$", mpdPathSegmentIdentifier)
+						} else {
+							m.Logger.Warn("MPD Media template does not contain $Time$ or $Number$. Using template directly.", "stream_type", streamType, "quality_or_lang", qualityOrLangKey, "template", tempPath)
+							relativeSegmentPath = tempPath
+						}
+						upstreamSegmentURL := resolvedBaseURLStr + relativeSegmentPath
+
 						allSegments = append(allSegments, struct {
 							StartTime, Duration uint64
-							URL                 string
+							HLSURL              string
+							UpstreamURL         string
 						}{
-							StartTime: currentStartTime, Duration: s.D, URL: hlsSegmentURL, // Store the full HLS path
+							StartTime: currentStartTime, Duration: s.D, HLSURL: hlsSegmentURL, UpstreamURL: upstreamSegmentURL,
 						})
 						currentStartTime += s.D
 					}
 				}
 
 				if len(allSegments) == 0 {
-					log.Printf("generateMediaPlaylists: No segments generated for key %s in channel %s", playlistKey, channelID)
-					continue // Skip this playlist if no segments
+					m.Logger.Warn("No segments generated for key", "playlist_key", playlistKey, "channel_id", channelID)
+					continue
 				}
 
-				targetDuration := int(maxSegDurSeconds + 0.999) // Round up for target duration
+				targetDuration := int(maxSegDurSeconds + 0.999)
 				if targetDuration == 0 {
-					targetDuration = 10 // Default target duration
+					targetDuration = 10
 				}
 				playlistBuf.WriteString(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", targetDuration))
 				playlistBuf.WriteString(fmt.Sprintf("#EXT-X-MEDIA-SEQUENCE:%d\n", hlsBaseMediaSequence))
 
 				// EXT-X-MAP (Initialization Segment)
-				// Omit MAP for STPP->WebVTT converted tracks as WebVTT doesn't use MP4 init segments
-				if !(streamType == "subtitles" && IsSTPPTrack(&as)) {
+				if streamType != "subtitles" {
 					if segTemplate.Initialization != "" {
-						// The HLS init segment URI will be proxied, so it needs a distinct name like "init.m4s"
-						// For STPP (non-converted) or other MP4 based subtitles, it might still be init.m4s
 						hlsInitSegmentName := "init.m4s"
-						// If we were to support STPP as .mp4 segments directly in HLS (not converting to VTT),
-						// this init segment name might need to be different or handled specifically.
-						// But since all STPP is converted to VTT, this branch is for non-STPP or non-subtitle tracks.
 						mapURI := fmt.Sprintf("/hls/%s/%s/%s/%s", channelID, streamType, qualityOrLangKey, hlsInitSegmentName)
 						playlistBuf.WriteString(fmt.Sprintf("#EXT-X-MAP:URI=\"%s\"\n", mapURI))
 					}
 				}
 
 				// EXT-X-KEY (Encryption)
-				if len(parsedKey) > 0 && streamType != "subtitles" { // Typically, subtitles are not encrypted this way
+				if len(parsedKey) > 0 && streamType != "subtitles" {
 					keyURI := fmt.Sprintf("/hls/%s/key", channelID)
 					playlistBuf.WriteString(fmt.Sprintf("#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"%s\",KEYFORMAT=\"identity\"\n", keyURI))
 				}
@@ -939,7 +1232,10 @@ func generateMediaPlaylists(mpdData *mpd.MPD, finalMPDURLStr string, channelID s
 					seg := allSegments[k]
 					segDurationSeconds := float64(seg.Duration) / float64(timescale)
 					playlistBuf.WriteString(fmt.Sprintf("#EXTINF:%.3f,\n", segDurationSeconds))
-					playlistBuf.WriteString(seg.URL + "\n") // Use the pre-constructed HLS path
+					// Use the HLS proxy URL
+					playlistBuf.WriteString(seg.HLSURL + "\n")
+					// Add to preloading map
+					segmentsToPreload[seg.HLSURL] = seg.UpstreamURL
 				}
 
 				if mpdData.Type == "static" {
@@ -950,42 +1246,50 @@ func generateMediaPlaylists(mpdData *mpd.MPD, finalMPDURLStr string, channelID s
 		}
 	}
 	if len(playlists) == 0 {
-		log.Printf("Warning: generateMediaPlaylists produced no playlists for channel %s", channelID)
+		m.Logger.Warn("generateMediaPlaylists produced no playlists", "channel_id", channelID)
 	}
-	return playlists, nil
+	return playlists, segmentsToPreload, nil
 }
 
 // Helper functions to get a consistent index for default naming of audio/subtitle tracks
-func adaptacionSetAudioIndex(mpdData *mpd.MPD, targetAs *mpd.AdaptationSet) int {
+func adaptationSetAudioIndex(mpdData *mpd.MPD, targetAs *mpd.AdaptationSet) int {
 	idx := 0
 	for _, p := range mpdData.Periods {
-		for _, as := range p.AdaptationSets {
+		for i := range p.AdaptationSets {
+			// Get a pointer to the actual element
+			as := &p.AdaptationSets[i]
 			if as.ContentType == "audio" || strings.Contains(as.MimeType, "audio") {
-				if &as == targetAs { // Compare pointers
+				// Compare IDs
+				if as.ID == targetAs.ID {
 					return idx
 				}
 				idx++
 			}
 		}
 	}
-	return -1 // Should not happen if targetAs is from mpdData
+	// Should not happen if targetAs is from mpdData
+	return -1
 }
 
-func adaptaciónSetSubtitleIndex(mpdData *mpd.MPD, targetAs *mpd.AdaptationSet) int {
+func adaptationSetSubtitleIndex(mpdData *mpd.MPD, targetAs *mpd.AdaptationSet) int {
 	idx := 0
 	for _, p := range mpdData.Periods {
-		for _, as := range p.AdaptationSets {
+		for i := range p.AdaptationSets {
+			// Get a pointer to the actual element
+			as := &p.AdaptationSets[i]
 			// Adjusted condition to correctly identify subtitle tracks for indexing
 			if as.ContentType == "text" ||
 				strings.Contains(as.MimeType, "text") ||
 				strings.Contains(as.MimeType, "application/ttml+xml") ||
-				(strings.Contains(as.MimeType, "application/mp4") && (strings.Contains(as.Representations[0].Codecs, "wvtt") || strings.Contains(as.Representations[0].Codecs, "stpp"))) {
-				if &as == targetAs { // Compare pointers
+				(strings.Contains(as.MimeType, "application/mp4") && len(as.Representations) > 0 && strings.Contains(as.Representations[0].Codecs, "wvtt")) {
+				// Compare IDs
+				if as.ID == targetAs.ID {
 					return idx
 				}
 				idx++
 			}
 		}
 	}
-	return -1 // Should not happen
+	// Should not happen
+	return -1
 }

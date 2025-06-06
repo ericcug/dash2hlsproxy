@@ -24,16 +24,16 @@ WORKDIR /app
 # Copy the pre-built binary from the builder stage
 COPY --from=builder /app/dash2hlsproxy .
 
-# Expose port 8080 (default, can be overridden by D2H_LISTEN_ADDR)
+# Expose port 8080 (default, can be overridden by LISTEN_ADDR)
 EXPOSE 8080
 
 # Environment variables for configuration
-# D2H_CHANNELS_JSON_PATH: Path to the channels configuration file (e.g., /config/channels.json)
-# D2H_LISTEN_ADDR: Address and port to listen on (e.g., :8080)
+# CHANNELS_JSON_PATH: Path to the channels configuration file (e.g., /config/channels.json)
+# LISTEN_ADDR: Address and port to listen on (e.g., :8080)
 
 # Set the entrypoint for the container
 ENTRYPOINT ["/app/dash2hlsproxy"]
 
 # Optional: Default command if needed, but ENTRYPOINT is usually sufficient for Go apps.
-# CMD ["--config", "/app/config/channels.json"] # Example, if you want a default config path if D2H_CHANNELS_JSON_PATH is not set
+# CMD ["--config", "/app/config/channels.json"] # Example, if you want a default config path if CHANNELS_JSON_PATH is not set
 # However, our Go app now handles default config path internally if env var is not set.

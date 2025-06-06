@@ -4,23 +4,24 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 )
 
-// ContentProtection represents the ContentProtection XML element.
+// ContentProtection 表示 ContentProtection XML 元素。
 type ContentProtection struct {
-	XMLName        xml.Name `xml:"ContentProtection"`
-	SchemeIDURI    string   `xml:"schemeIdUri,attr"`
-	Value          string   `xml:"value,attr,omitempty"`
-	CencDefaultKID string   `xml:"urn:mpeg:cenc:2013 default_KID,attr,omitempty"` // Parses cenc:default_KID attribute
-	PSSH           string   `xml:"pssh,omitempty"`
-	MsprPro        string   `xml:"pro,omitempty"`
+	XMLName     xml.Name `xml:"ContentProtection"`
+	SchemeIDURI string   `xml:"schemeIdUri,attr"`
+	Value       string   `xml:"value,attr,omitempty"`
+	// 解析 cenc:default_KID 属性
+	CencDefaultKID string `xml:"urn:mpeg:cenc:2013 cenc:default_KID,attr,omitempty"`
+	PSSH           string `xml:"pssh,omitempty"`
+	MsprPro        string `xml:"pro,omitempty"`
 }
 
-// S represents a segment in the SegmentTimeline.
+// S 表示 SegmentTimeline 中的一个段。
 type S struct {
 	XMLName xml.Name `xml:"S"`
 	T       *uint64  `xml:"t,attr"`
@@ -28,13 +29,13 @@ type S struct {
 	R       *int     `xml:"r,attr"`
 }
 
-// SegmentTimeline represents the SegmentTimeline XML element.
+// SegmentTimeline 表示 SegmentTimeline XML 元素。
 type SegmentTimeline struct {
 	XMLName  xml.Name `xml:"SegmentTimeline"`
 	Segments []S      `xml:"S"`
 }
 
-// SegmentTemplate represents the SegmentTemplate XML element.
+// SegmentTemplate 表示 SegmentTemplate XML 元素。
 type SegmentTemplate struct {
 	XMLName                xml.Name         `xml:"SegmentTemplate"`
 	Timescale              *uint64          `xml:"timescale,attr"`
@@ -44,7 +45,7 @@ type SegmentTemplate struct {
 	SegmentTimeline        *SegmentTimeline `xml:"SegmentTimeline"`
 }
 
-// Representation represents the Representation XML element.
+// Representation 表示 Representation XML 元素。
 type Representation struct {
 	XMLName            xml.Name `xml:"Representation"`
 	ID                 string   `xml:"id,attr"`
@@ -63,7 +64,7 @@ type Representation struct {
 	SegmentTemplate *SegmentTemplate `xml:"SegmentTemplate"`
 }
 
-// AdaptationSet represents the AdaptationSet XML element.
+// AdaptationSet 表示 AdaptationSet XML 元素。
 type AdaptationSet struct {
 	XMLName            xml.Name            `xml:"AdaptationSet"`
 	ID                 string              `xml:"id,attr,omitempty"`
@@ -83,7 +84,7 @@ type AdaptationSet struct {
 	BaseURL            string              `xml:"BaseURL,omitempty"`
 }
 
-// Period represents the Period XML element.
+// Period 表示 Period XML 元素。
 type Period struct {
 	XMLName        xml.Name        `xml:"Period"`
 	ID             string          `xml:"id,attr,omitempty"`
@@ -92,7 +93,7 @@ type Period struct {
 	AdaptationSets []AdaptationSet `xml:"AdaptationSet"`
 }
 
-// MPD represents the root MPD XML element.
+// MPD 表示根 MPD XML 元素。
 type MPD struct {
 	XMLName               xml.Name `xml:"urn:mpeg:dash:schema:mpd:2011 MPD"`
 	Profiles              string   `xml:"profiles,attr"`
@@ -179,24 +180,26 @@ func FetchAndParseMPD(initialMPDURL string, userAgent string) (string, *MPD, err
 
 func (as *AdaptationSet) GetDefaultKID() string {
 	if as == nil {
-		log.Println("GetDefaultKID called on nil AdaptationSet")
+		slog.Warn("GetDefaultKID called on nil AdaptationSet")
 		return ""
 	}
-	log.Printf("GetDefaultKID: Checking AdaptationSet ID '%s', ContentType '%s', Lang '%s'. Found %d ContentProtection elements.", as.ID, as.ContentType, as.Lang, len(as.ContentProtections))
+	logger := slog.With("module", "mpd", "as_id", as.ID, "content_type", as.ContentType, "lang", as.Lang)
+	logger.Debug("Checking for default KID", "cp_count", len(as.ContentProtections))
+
 	for i, cp := range as.ContentProtections {
-		log.Printf("GetDefaultKID: ContentProtection[%d]: SchemeIDURI='%s', Value='%s', CencDefaultKID_Attr='%s'", i, cp.SchemeIDURI, cp.Value, cp.CencDefaultKID)
+		cpLogger := logger.With("cp_index", i, "scheme", cp.SchemeIDURI, "value", cp.Value, "kid_attr", cp.CencDefaultKID)
 		isCENCSystem := strings.ToLower(cp.SchemeIDURI) == "urn:mpeg:dash:mp4protection:2011" && cp.Value == "cenc"
 
 		if isCENCSystem {
 			if cp.CencDefaultKID != "" {
 				kid := strings.ReplaceAll(cp.CencDefaultKID, "-", "")
-				log.Printf("GetDefaultKID: Found CENC ContentProtection. KID from MPD attribute: '%s', Processed KID: '%s'", cp.CencDefaultKID, kid)
+				cpLogger.Info("Found CENC ContentProtection with default KID", "processed_kid", kid)
 				return kid
 			} else {
-				log.Printf("GetDefaultKID: CENC ContentProtection found, but cenc:default_KID attribute is empty or missing.")
+				cpLogger.Debug("CENC ContentProtection found, but cenc:default_KID attribute is empty or missing.")
 			}
 		}
 	}
-	log.Printf("GetDefaultKID: No suitable cenc:default_KID found in AdaptationSet ID '%s'", as.ID)
+	logger.Debug("No suitable cenc:default_KID found in AdaptationSet")
 	return ""
 }
