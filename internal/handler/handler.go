@@ -158,6 +158,19 @@ func (appCtx *AppContext) segmentProxyHandler(w http.ResponseWriter, r *http.Req
 	// 构造用于 HLS URL 的分段路径，它将作为缓存键
 	segmentKey := fmt.Sprintf("/hls/%s/%s/%s/%s", channelCfg.ID, streamType, qualityOrLang, segmentName)
 
+	// 0. 检查请求的 segment 是否在当前有效的播放列表中
+	cachedEntry.Mux.RLock()
+	_, isValidSegment := cachedEntry.ValidSegments[segmentKey]
+	cachedEntry.Mux.RUnlock()
+
+	if !isValidSegment {
+		appCtx.Logger.Warn("Rejecting request for segment not in the current valid playlist",
+			"key", segmentKey,
+			"channel_id", channelCfg.ID)
+		http.Error(w, "Segment not found in current playlist", http.StatusNotFound)
+		return
+	}
+
 	// 1. 检查缓存
 	cachedEntry.SegmentCache.RLock()
 	cachedSeg, segmentExists := cachedEntry.SegmentCache.Segments[segmentKey]

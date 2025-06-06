@@ -287,6 +287,8 @@ type CachedMPD struct {
 	PrecomputedData map[string]map[string]PrecomputedSegmentData
 	// 用于 SEGMENT 缓存的新字段
 	SegmentCache *SegmentCache
+	// ValidSegments 存储当前播放列表中所有有效的 segment key
+	ValidSegments map[string]struct{}
 	// 用于通知预加载器更新其 SEGMENT 列表
 	preloaderUpdateCh chan struct{}
 }
@@ -367,6 +369,8 @@ func (m *MPDManager) GetMPD(channelCfg *config.ChannelConfig) (string, *mpd.MPD,
 			SegmentCache: &SegmentCache{
 				Segments: make(map[string]*CachedSegment),
 			},
+			// 初始化 ValidSegments
+			ValidSegments: make(map[string]struct{}),
 			// 缓冲 channel，防止阻塞
 			preloaderUpdateCh: make(chan struct{}, 1),
 		}
@@ -479,11 +483,12 @@ func (m *MPDManager) GetMPD(channelCfg *config.ChannelConfig) (string, *mpd.MPD,
 		entry.MasterPlaylist = masterPl
 	}
 
-	mediaPls, segmentsToPreload, errMedia := m.generateMediaPlaylists(entry.Data, entry.FinalMPDURL, channelCfg.ID, entry.HLSBaseMediaSequence, channelCfg.ParsedKey)
+	mediaPls, segmentsToPreload, validSegs, errMedia := m.generateMediaPlaylists(entry.Data, entry.FinalMPDURL, channelCfg.ID, entry.HLSBaseMediaSequence, channelCfg.ParsedKey)
 	if errMedia != nil {
 		m.Logger.Error("Error generating media playlists", "channel_id", channelCfg.ID, "error", errMedia)
 	} else {
 		entry.MediaPlaylists = mediaPls
+		entry.ValidSegments = validSegs
 		// 通知预加载器更新 SEGMENT 列表
 		if m.Preloader != nil {
 			m.Preloader.UpdateSegmentsToPreload(channelCfg.ID, segmentsToPreload)
@@ -754,11 +759,12 @@ func (m *MPDManager) autoUpdateMPD(channelCfg *config.ChannelConfig, cachedEntry
 					cachedEntry.MasterPlaylist = masterPl
 				}
 
-				mediaPls, segmentsToPreload, errMedia := m.generateMediaPlaylists(cachedEntry.Data, cachedEntry.FinalMPDURL, channelCfg.ID, cachedEntry.HLSBaseMediaSequence, channelCfg.ParsedKey)
+				mediaPls, segmentsToPreload, validSegs, errMedia := m.generateMediaPlaylists(cachedEntry.Data, cachedEntry.FinalMPDURL, channelCfg.ID, cachedEntry.HLSBaseMediaSequence, channelCfg.ParsedKey)
 				if errMedia != nil {
 					m.Logger.Error("AutoUpdater: Error generating media playlists", "channel_id", channelCfg.ID, "error", errMedia)
 				} else {
 					cachedEntry.MediaPlaylists = mediaPls
+					cachedEntry.ValidSegments = validSegs
 					// 通知预加载器更新 SEGMENT 列表
 					if m.Preloader != nil {
 						m.Preloader.UpdateSegmentsToPreload(channelCfg.ID, segmentsToPreload)
@@ -1022,16 +1028,18 @@ func generateMasterPlaylist(mpdData *mpd.MPD, channelID string) (string, error) 
 }
 
 // generateMediaPlaylists generates all HLS media playlist strings.
-// It also returns a map of segment keys to their upstream URLs for preloading.
-func (m *MPDManager) generateMediaPlaylists(mpdData *mpd.MPD, finalMPDURLStr string, channelID string, hlsBaseMediaSequence uint64, parsedKey []byte) (map[string]string, map[string]string, error) {
+// It also returns a map of segment keys to their upstream URLs for preloading, and a set of valid segment keys.
+func (m *MPDManager) generateMediaPlaylists(mpdData *mpd.MPD, finalMPDURLStr string, channelID string, hlsBaseMediaSequence uint64, parsedKey []byte) (map[string]string, map[string]string, map[string]struct{}, error) {
 	playlists := make(map[string]string)
 	// New map to return segment URLs for preloading
 	segmentsToPreload := make(map[string]string)
+	// New set to store all valid segment keys from the generated playlists
+	validSegments := make(map[string]struct{})
 
 	finalMPDURL, errParseMPDURL := url.Parse(finalMPDURLStr)
 	if errParseMPDURL != nil {
 		m.Logger.Error("Error parsing finalMPDURLStr", "url", finalMPDURLStr, "error", errParseMPDURL)
-		return playlists, segmentsToPreload, fmt.Errorf("error parsing final MPD URL: %w", errParseMPDURL)
+		return nil, nil, nil, fmt.Errorf("error parsing final MPD URL: %w", errParseMPDURL)
 	}
 
 	for _, period := range mpdData.Periods {
@@ -1150,6 +1158,7 @@ func (m *MPDManager) generateMediaPlaylists(mpdData *mpd.MPD, finalMPDURLStr str
 					upstreamInitURL := resolvedBaseURLStr + initRelativePath
 
 					segmentsToPreload[hlsInitSegmentURL] = upstreamInitURL
+					validSegments[hlsInitSegmentURL] = struct{}{}
 				}
 
 				for _, s := range segTemplate.SegmentTimeline.Segments {
@@ -1239,6 +1248,8 @@ func (m *MPDManager) generateMediaPlaylists(mpdData *mpd.MPD, finalMPDURLStr str
 					playlistBuf.WriteString(seg.HLSURL + "\n")
 					// Add to preloading map
 					segmentsToPreload[seg.HLSURL] = seg.UpstreamURL
+					// Add to valid segments set
+					validSegments[seg.HLSURL] = struct{}{}
 				}
 
 				if mpdData.Type == "static" {
@@ -1251,7 +1262,68 @@ func (m *MPDManager) generateMediaPlaylists(mpdData *mpd.MPD, finalMPDURLStr str
 	if len(playlists) == 0 {
 		m.Logger.Warn("generateMediaPlaylists produced no playlists", "channel_id", channelID)
 	}
-	return playlists, segmentsToPreload, nil
+	return playlists, segmentsToPreload, validSegments, nil
+}
+
+// StartJanitor starts the background cleanup task for segment caches.
+func (m *MPDManager) StartJanitor(ctx context.Context) {
+	m.Logger.Info("Starting segment cache janitor...")
+	ticker := time.NewTicker(1 * time.Minute) // Run every minute
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				m.cleanupExpiredSegments()
+			case <-ctx.Done():
+				m.Logger.Info("Stopping segment cache janitor.")
+				ticker.Stop()
+				return
+			}
+		}
+	}()
+}
+
+// cleanupExpiredSegments iterates through all caches and removes old segments.
+func (m *MPDManager) cleanupExpiredSegments() {
+	const maxAge = 2 * time.Minute // Segments older than 2 minutes will be removed.
+	m.CacheLock.RLock()
+	defer m.CacheLock.RUnlock()
+
+	if len(m.MPDCache) == 0 {
+		return
+	}
+
+	m.Logger.Debug("Running segment cache cleanup...")
+	for channelID, cachedEntry := range m.MPDCache {
+		cachedEntry.Mux.Lock() // Use a full lock to modify the cache
+		if cachedEntry.SegmentCache == nil {
+			cachedEntry.Mux.Unlock()
+			continue
+		}
+
+		initialCount := len(cachedEntry.SegmentCache.Segments)
+		if initialCount == 0 {
+			cachedEntry.Mux.Unlock()
+			continue
+		}
+
+		for key, segment := range cachedEntry.SegmentCache.Segments {
+			if time.Since(segment.FetchedAt) > maxAge {
+				delete(cachedEntry.SegmentCache.Segments, key)
+			}
+		}
+
+		finalCount := len(cachedEntry.SegmentCache.Segments)
+		cachedEntry.Mux.Unlock()
+
+		if initialCount != finalCount {
+			m.Logger.Info("Segment cache cleanup finished for channel",
+				"channel_id", channelID,
+				"initial_count", initialCount,
+				"final_count", finalCount,
+				"removed_count", initialCount-finalCount)
+		}
+	}
 }
 
 // Helper functions to get a consistent index for default naming of audio/subtitle tracks

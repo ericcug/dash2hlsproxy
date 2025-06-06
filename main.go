@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log/slog"
 	"net/http"
@@ -74,6 +75,9 @@ func main() {
 	logger.Info("Configuration loaded. Setting up HTTP server...")
 
 	mpdMngr := mpd_manager.NewMPDManager(cfg, logger.With("module", "mpd_manager"))
+
+	// 启动后台缓存清理任务
+	mpdMngr.StartJanitor(context.Background())
 
 	// 创建一个带有优化传输的共享 HTTP 客户端
 	sharedHTTPClient := &http.Client{
