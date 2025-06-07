@@ -87,10 +87,9 @@ func main() {
 	mpdMngr := mpd_manager.NewMPDManager(cfg, logger.With("module", "mpd_manager"), sharedHTTPClient)
 
 	// 启动下载器和缓存清理器
-	mpdMngr.Downloader.Start(context.Background())
-
-	// 启动后台缓存清理任务
-	mpdMngr.StartJanitor(context.Background())
+	ctx := context.Background()
+	mpdMngr.Downloader.Start(ctx)
+	mpdMngr.Updater.StartJanitor(ctx)
 
 	appCtx := &handler.AppContext{
 		Config:     cfg,
