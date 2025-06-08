@@ -86,18 +86,43 @@ func (appCtx *AppContext) masterPlaylistHandler(w http.ResponseWriter, r *http.R
 	cachedEntry, exists := appCtx.MPDManager.GetCachedEntry(channelCfg.ID)
 	if !exists || cachedEntry.MasterPlaylist == "" {
 		appCtx.Logger.Error("Master playlist not found in cache", "channel_name", channelCfg.Name, "channel_id", channelCfg.ID)
-		// 回退或错误：重新生成或报错。目前，如果未预生成则报错。
-		// 如果期望它始终存在，这表明预生成逻辑存在严重问题。
 		http.Error(w, "Master playlist not available", http.StatusInternalServerError)
 		return
 	}
+
+	// --- 新增逻辑：等待所有媒体播放列表的分片都准备就绪 ---
+	var requiredSegments []string
+	cachedEntry.Mux.RLock()
+	for key, playlistStr := range cachedEntry.MediaPlaylists {
+		for _, line := range strings.Split(playlistStr, "\n") {
+			if strings.HasPrefix(line, "/hls/") {
+				requiredSegments = append(requiredSegments, line)
+			}
+		}
+		appCtx.Logger.Debug("Collected segments from media playlist", "key", key)
+	}
+	cachedEntry.Mux.RUnlock()
+
+	if len(requiredSegments) > 0 {
+		// 设置一个足够长的超时时间，以等待所有分片缓存
+		timeout := 20 * time.Second
+		err := appCtx.MPDManager.WaitForSegments(r.Context(), channelCfg.ID, requiredSegments, timeout)
+		if err != nil {
+			appCtx.Logger.Error("Error waiting for all segments to be cached for master playlist",
+				"channel_id", channelCfg.ID,
+				"error", err)
+			http.Error(w, "Failed to cache all necessary segments in time", http.StatusServiceUnavailable)
+			return
+		}
+		appCtx.Logger.Info("All required segments are cached. Proceeding to serve master playlist.", "channel_id", channelCfg.ID)
+	}
+	// --- 结束新增逻辑 ---
 
 	cachedEntry.Mux.Lock()
 	cachedEntry.LastAccessedAt = time.Now()
 	cachedEntry.Mux.Unlock()
 
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-	// 锁定以读取 MasterPlaylist
 	cachedEntry.Mux.RLock()
 	playlistContent := cachedEntry.MasterPlaylist
 	cachedEntry.Mux.RUnlock()
@@ -141,29 +166,6 @@ func (appCtx *AppContext) mediaPlaylistHandler(w http.ResponseWriter, r *http.Re
 		http.Error(w, "Requested media playlist not available", http.StatusNotFound)
 		return
 	}
-
-	// --- 新增逻辑：等待分片缓存 ---
-	var requiredSegments []string
-	for _, line := range strings.Split(playlistStr, "\n") {
-		if strings.HasPrefix(line, "/hls/") {
-			requiredSegments = append(requiredSegments, line)
-		}
-	}
-
-	if len(requiredSegments) > 0 {
-		// 设置一个合理的超时时间，例如10秒
-		timeout := 10 * time.Second
-		err := appCtx.MPDManager.WaitForSegments(r.Context(), channelCfg.ID, requiredSegments, timeout)
-		if err != nil {
-			appCtx.Logger.Error("Error waiting for segments to be cached",
-				"key", mediaPlaylistKey,
-				"channel_id", channelCfg.ID,
-				"error", err)
-			http.Error(w, "Failed to cache segments in time", http.StatusInternalServerError)
-			return
-		}
-	}
-	// --- 结束新增逻辑 ---
 
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 	fmt.Fprint(w, playlistStr)
