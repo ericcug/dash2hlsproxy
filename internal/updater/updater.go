@@ -229,7 +229,11 @@ func (s *Service) processMPDUpdates(channelCfg *config.ChannelConfig, entry *cac
 	}
 	entry.MasterPlaylist = masterPl
 
-	mediaPls, segmentsToPreload, _, err := playlist.GenerateMediaPlaylists(s.Logger, entry.Data, entry.FinalMPDURL, channelCfg.ID, entry.HLSBaseMediaSequence, channelCfg.ParsedKey, selectedRepIDs)
+	livePlaylistDuration := s.Config.LivePlaylistDuration
+	if livePlaylistDuration <= 0 {
+		livePlaylistDuration = 30 // Fallback to a default value of 30 seconds
+	}
+	mediaPls, segmentsToPreload, _, err := playlist.GenerateMediaPlaylists(s.Logger, entry.Data, entry.FinalMPDURL, channelCfg.ID, entry.HLSBaseMediaSequence, channelCfg.ParsedKey, selectedRepIDs, livePlaylistDuration)
 	if err != nil {
 		s.Logger.Error("Error generating media playlists", "channel_id", channelCfg.ID, "error", err)
 	} else {
@@ -250,14 +254,76 @@ func (s *Service) processMPDUpdates(channelCfg *config.ChannelConfig, entry *cac
 
 func (s *Service) updateSequence(entry *cache.MPDEntry) {
 	newPublishTime, ptErr := fetch.ParsePublishTime(entry.Data.PublishTime)
-	if ptErr == nil {
-		if entry.LastMPDPublishTime.IsZero() || newPublishTime.After(entry.LastMPDPublishTime) {
-			if !entry.LastMPDPublishTime.IsZero() {
-				entry.HLSBaseMediaSequence++
-			}
-			entry.LastMPDPublishTime = newPublishTime
-		}
-	} else {
-		s.Logger.Warn("Could not parse PublishTime", "publish_time", entry.Data.PublishTime, "error", ptErr)
+	if ptErr != nil {
+		s.Logger.Warn("Could not parse PublishTime, sequence not updated", "publish_time", entry.Data.PublishTime, "error", ptErr)
+		return
 	}
+
+	if entry.LastMPDPublishTime.IsZero() {
+		entry.LastMPDPublishTime = newPublishTime
+		entry.LastSegmentTimes = collectSegmentTimes(entry.Data)
+		return
+	}
+
+	if !newPublishTime.After(entry.LastMPDPublishTime) {
+		return
+	}
+
+	newSegmentTimes := collectSegmentTimes(entry.Data)
+	hasNewSegments := false
+	for timeKey := range newSegmentTimes {
+		if _, exists := entry.LastSegmentTimes[timeKey]; !exists {
+			hasNewSegments = true
+			break
+		}
+	}
+
+	if hasNewSegments {
+		s.Logger.Debug("New segments detected, incrementing HLS base media sequence.", "channel_id", entry.Data.Periods[0].ID)
+		entry.HLSBaseMediaSequence++
+	}
+
+	entry.LastMPDPublishTime = newPublishTime
+	entry.LastSegmentTimes = newSegmentTimes
+}
+
+// collectSegmentTimes 从 MPD 中提取所有分片的开始时间，并以 map 的形式返回以便快速查找。
+func collectSegmentTimes(mpdData *mpd.MPD) map[uint64]struct{} {
+	times := make(map[uint64]struct{})
+	if mpdData == nil {
+		return times
+	}
+
+	for _, period := range mpdData.Periods {
+		for _, as := range period.AdaptationSets {
+			segTemplate := as.SegmentTemplate
+			for _, rep := range as.Representations {
+				if rep.SegmentTemplate != nil {
+					segTemplate = rep.SegmentTemplate
+				}
+
+				if segTemplate != nil && segTemplate.SegmentTimeline != nil {
+					currentStartTime := uint64(0)
+					if len(segTemplate.SegmentTimeline.Segments) > 0 && segTemplate.SegmentTimeline.Segments[0].T != nil {
+						currentStartTime = *segTemplate.SegmentTimeline.Segments[0].T
+					}
+
+					for _, s := range segTemplate.SegmentTimeline.Segments {
+						if s.T != nil {
+							currentStartTime = *s.T
+						}
+						repeatCount := 0
+						if s.R != nil {
+							repeatCount = *s.R
+						}
+						for rIdx := 0; rIdx <= repeatCount; rIdx++ {
+							times[currentStartTime] = struct{}{}
+							currentStartTime += s.D
+						}
+					}
+				}
+			}
+		}
+	}
+	return times
 }

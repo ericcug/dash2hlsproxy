@@ -69,6 +69,7 @@ type MPDEntry struct {
 	StopAutoUpdateCh       chan struct{}
 	HLSBaseMediaSequence   uint64
 	LastMPDPublishTime     time.Time
+	LastSegmentTimes       map[uint64]struct{}
 	InitialBaseURL         string
 	InitialBaseURLIsSet    bool
 	MasterPlaylist         string

@@ -11,9 +11,6 @@ import (
 	"dash2hlsproxy/internal/mpd"
 )
 
-// 在实时媒体播放列表中保留的段数
-const numLiveSegments = 5
-
 // GenerateMasterPlaylist generates the HLS master playlist string and returns a list of selected representation IDs.
 func GenerateMasterPlaylist(mpdData *mpd.MPD, channelID string) (string, []string, error) {
 	var playlist bytes.Buffer
@@ -149,7 +146,7 @@ func GenerateMasterPlaylist(mpdData *mpd.MPD, channelID string) (string, []strin
 }
 
 // GenerateMediaPlaylists generates HLS media playlists only for the selected representations.
-func GenerateMediaPlaylists(logger *slog.Logger, mpdData *mpd.MPD, finalMPDURLStr string, channelID string, hlsBaseMediaSequence uint64, parsedKey []byte, selectedRepIDs []string) (map[string]string, map[string]string, map[string]struct{}, error) {
+func GenerateMediaPlaylists(logger *slog.Logger, mpdData *mpd.MPD, finalMPDURLStr string, channelID string, hlsBaseMediaSequence uint64, parsedKey []byte, selectedRepIDs []string, livePlaylistDuration int) (map[string]string, map[string]string, map[string]struct{}, error) {
 	playlists := make(map[string]string)
 	segmentsToPreload := make(map[string]string)
 	validSegments := make(map[string]struct{})
@@ -273,18 +270,6 @@ func GenerateMediaPlaylists(logger *slog.Logger, mpdData *mpd.MPD, finalMPDURLSt
 					resolvedBaseURLStr += "/"
 				}
 
-				// Handle Initialization Segment for preloading
-				if streamType != "subtitles" && segTemplate.Initialization != "" {
-					hlsInitSegmentName := "init.m4s"
-					hlsInitSegmentURL := fmt.Sprintf("/hls/%s/%s/%s/%s", channelID, streamType, qualityOrLangKey, hlsInitSegmentName)
-
-					initRelativePath := strings.ReplaceAll(segTemplate.Initialization, "$RepresentationID$", rep.ID)
-					upstreamInitURL := resolvedBaseURLStr + initRelativePath
-
-					segmentsToPreload[hlsInitSegmentURL] = upstreamInitURL
-					validSegments[hlsInitSegmentURL] = struct{}{}
-				}
-
 				for _, s := range segTemplate.SegmentTimeline.Segments {
 					if s.T != nil {
 						currentStartTime = *s.T
@@ -343,13 +328,17 @@ func GenerateMediaPlaylists(logger *slog.Logger, mpdData *mpd.MPD, finalMPDURLSt
 				playlistBuf.WriteString(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", targetDuration))
 				playlistBuf.WriteString(fmt.Sprintf("#EXT-X-MEDIA-SEQUENCE:%d\n", hlsBaseMediaSequence))
 
-				// EXT-X-MAP (Initialization Segment)
-				if streamType != "subtitles" {
-					if segTemplate.Initialization != "" {
-						hlsInitSegmentName := "init.m4s"
-						mapURI := fmt.Sprintf("/hls/%s/%s/%s/%s", channelID, streamType, qualityOrLangKey, hlsInitSegmentName)
-						playlistBuf.WriteString(fmt.Sprintf("#EXT-X-MAP:URI=\"%s\"\n", mapURI))
-					}
+				// EXT-X-MAP (Initialization Segment) & Preloading
+				if streamType != "subtitles" && segTemplate.Initialization != "" {
+					hlsInitSegmentName := "init.m4s"
+					mapURI := fmt.Sprintf("/hls/%s/%s/%s/%s", channelID, streamType, qualityOrLangKey, hlsInitSegmentName)
+					playlistBuf.WriteString(fmt.Sprintf("#EXT-X-MAP:URI=\"%s\"\n", mapURI))
+
+					// Also add it to the preload and valid segments maps
+					initRelativePath := strings.ReplaceAll(segTemplate.Initialization, "$RepresentationID$", rep.ID)
+					upstreamInitURL := resolvedBaseURLStr + initRelativePath
+					segmentsToPreload[mapURI] = upstreamInitURL
+					validSegments[mapURI] = struct{}{}
 				}
 
 				// EXT-X-KEY (Encryption)
@@ -360,8 +349,18 @@ func GenerateMediaPlaylists(logger *slog.Logger, mpdData *mpd.MPD, finalMPDURLSt
 
 				// Segment list
 				startIndex := 0
-				if mpdData.Type == "dynamic" && len(allSegments) > numLiveSegments {
-					startIndex = len(allSegments) - numLiveSegments
+				if mpdData.Type == "dynamic" {
+					var currentDuration float64
+					targetDurationSeconds := float64(livePlaylistDuration)
+					// 从后向前遍历，累加时长，直到满足条件
+					for i := len(allSegments) - 1; i >= 0; i-- {
+						segDurationSeconds := float64(allSegments[i].Duration) / float64(timescale)
+						if currentDuration+segDurationSeconds > targetDurationSeconds && currentDuration > 0 {
+							break // 已经收集了足够时长的分片
+						}
+						currentDuration += segDurationSeconds
+						startIndex = i
+					}
 				}
 
 				for k := startIndex; k < len(allSegments); k++ {

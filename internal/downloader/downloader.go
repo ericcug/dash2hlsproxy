@@ -96,14 +96,32 @@ func (d *Downloader) worker(ctx context.Context) {
 				continue
 			}
 
-			// 为每个下载任务创建一个带超时的上下文
-			downloadCtx, cancel := context.WithTimeout(ctx, d.segmentDownloadTimeout)
-			data, contentType, err := d.fetcher.FetchSegment(downloadCtx, task.UpstreamURL, task.UserAgent)
-			cancel() // 及时释放资源
+			const maxRetries = 3
+			var data []byte
+			var contentType string
+			var err error
+
+			for i := 0; i < maxRetries; i++ {
+				downloadCtx, cancel := context.WithTimeout(ctx, d.segmentDownloadTimeout)
+				data, contentType, err = d.fetcher.FetchSegment(downloadCtx, task.UpstreamURL, task.UserAgent)
+				cancel() // 及时释放资源
+
+				if err == nil {
+					break // Download successful
+				}
+
+				d.logger.Warn("Downloader worker: Failed to download segment, retrying...",
+					"segment_key", task.SegmentKey,
+					"channel_id", task.ChannelID,
+					"retry_count", i+1,
+					"error", err)
+
+				// Exponential backoff
+				time.Sleep(time.Second * time.Duration(1<<i))
+			}
 
 			if err != nil {
-				d.logger.Error("Downloader worker: Failed to download segment", "segment_key", task.SegmentKey, "channel_id", task.ChannelID, "error", err)
-				// 即使下载失败，也要发出信号以解除任何等待者的阻塞
+				d.logger.Error("Downloader worker: Failed to download segment after all retries", "segment_key", task.SegmentKey, "channel_id", task.ChannelID, "error", err)
 				d.signalDownloadCompletion(task.ChannelID, task.SegmentKey)
 			} else {
 				cachedEntry.StoreSegment(task.SegmentKey, &fetch.CachedSegment{
@@ -112,7 +130,6 @@ func (d *Downloader) worker(ctx context.Context) {
 					FetchedAt:   time.Now(),
 				})
 				d.logger.Debug("Downloader worker: Successfully cached segment", "segment_key", task.SegmentKey, "channel_id", task.ChannelID)
-				// 仅在成功存储后发出信号
 				d.signalDownloadCompletion(task.ChannelID, task.SegmentKey)
 			}
 
