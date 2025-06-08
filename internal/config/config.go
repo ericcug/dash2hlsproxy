@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 )
 
@@ -37,12 +38,16 @@ type AppConfig struct {
 func LoadConfig(filePath string) (*AppConfig, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read channels file %s: %w", filePath, err)
+		err := fmt.Errorf("failed to read channels file %s: %w", filePath, err)
+		slog.Error("Failed to read config file", "path", filePath, "error", err)
+		return nil, err
 	}
 
 	var cfg AppConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal channels JSON from %s: %w", filePath, err)
+		err := fmt.Errorf("failed to unmarshal channels JSON from %s: %w", filePath, err)
+		slog.Error("Failed to unmarshal config JSON", "path", filePath, "error", err)
+		return nil, err
 	}
 
 	cfg.ChannelMap = make(map[string]*ChannelConfig)
@@ -53,7 +58,9 @@ func LoadConfig(filePath string) (*AppConfig, error) {
 		if ch.Key != "" {
 			keyBytes, err := hex.DecodeString(ch.Key)
 			if err != nil {
-				return nil, fmt.Errorf("failed to decode key hex '%s' for channel %s: %w", ch.Key, ch.ID, err)
+				err := fmt.Errorf("failed to decode key hex '%s' for channel %s: %w", ch.Key, ch.ID, err)
+				slog.Error("Failed to decode key hex", "key", ch.Key, "channel_id", ch.ID, "error", err)
+				return nil, err
 			}
 			// AES-128 密钥是 16 字节。如有必要，请添加验证。
 			// if len(keyBytes) != 16 {
@@ -63,7 +70,9 @@ func LoadConfig(filePath string) (*AppConfig, error) {
 		}
 
 		if _, exists := cfg.ChannelMap[ch.ID]; exists {
-			return nil, fmt.Errorf("duplicate channel ID '%s' found in configuration", ch.ID)
+			err := fmt.Errorf("duplicate channel ID '%s' found in configuration", ch.ID)
+			slog.Error("Duplicate channel ID found", "channel_id", ch.ID, "error", err)
+			return nil, err
 		}
 		cfg.ChannelMap[ch.ID] = ch
 	}

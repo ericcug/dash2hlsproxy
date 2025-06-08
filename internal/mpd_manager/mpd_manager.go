@@ -54,7 +54,7 @@ func (m *MPDManager) GetCachedEntry(channelID string) (*cache.MPDEntry, bool) {
 }
 
 // GetMPD 获取指定频道的 MPD。它会处理缓存、获取和更新逻辑。
-func (m *MPDManager) GetMPD(channelCfg *config.ChannelConfig) (string, *mpd.MPD, error) {
+func (m *MPDManager) GetMPD(ctx context.Context, channelCfg *config.ChannelConfig) (string, *mpd.MPD, error) {
 	if cachedEntry, exists := m.GetCachedEntry(channelCfg.ID); exists {
 		cachedEntry.Mux.RLock()
 		if entryData := cachedEntry.Data; entryData != nil {
@@ -79,7 +79,7 @@ func (m *MPDManager) GetMPD(channelCfg *config.ChannelConfig) (string, *mpd.MPD,
 	}
 	entry.Mux.Unlock()
 
-	finalURL, mpdData, err := m.fetchAndProcessMPD(channelCfg, entry)
+	finalURL, mpdData, err := m.fetchAndProcessMPD(ctx, channelCfg, entry)
 	if err != nil {
 		m.Cache.DeleteEntry(channelCfg.ID)
 		return "", nil, err
@@ -104,7 +104,7 @@ func (m *MPDManager) GetMPD(channelCfg *config.ChannelConfig) (string, *mpd.MPD,
 	return finalURL, mpdData, nil
 }
 
-func (m *MPDManager) fetchAndProcessMPD(channelCfg *config.ChannelConfig, entry *cache.MPDEntry) (string, *mpd.MPD, error) {
+func (m *MPDManager) fetchAndProcessMPD(ctx context.Context, channelCfg *config.ChannelConfig, entry *cache.MPDEntry) (string, *mpd.MPD, error) {
 	entry.Mux.RLock()
 	urlToFetch := channelCfg.Manifest
 	if entry.FinalMPDURL != "" {
@@ -115,7 +115,7 @@ func (m *MPDManager) fetchAndProcessMPD(channelCfg *config.ChannelConfig, entry 
 	entry.Mux.RUnlock()
 
 	newFinalURL, fetchedBaseURL, newMPDData, err := m.Fetcher.FetchMPDWithRetry(
-		urlToFetch, m.Config.UserAgent,
+		ctx, urlToFetch, m.Config.UserAgent,
 		initialBaseURL, initialBaseURLIsSet,
 	)
 	if err != nil {
@@ -158,11 +158,12 @@ func (m *MPDManager) processMPDUpdates(channelCfg *config.ChannelConfig, entry *
 	}
 	entry.MasterPlaylist = masterPl
 
-	mediaPls, segmentsToPreload, _, err := playlist.GenerateMediaPlaylists(m.Logger, entry.Data, entry.FinalMPDURL, channelCfg.ID, entry.HLSBaseMediaSequence, channelCfg.ParsedKey, selectedRepIDs)
+	mediaPls, segmentsToPreload, validSegments, err := playlist.GenerateMediaPlaylists(m.Logger, entry.Data, entry.FinalMPDURL, channelCfg.ID, entry.HLSBaseMediaSequence, channelCfg.ParsedKey, selectedRepIDs)
 	if err != nil {
 		m.Logger.Error("Error generating media playlists", "channel_id", channelCfg.ID, "error", err)
 	} else {
 		entry.MediaPlaylists = mediaPls
+		entry.PruneSegments(validSegments) // Prune old segments
 		for segmentKey, upstreamURL := range segmentsToPreload {
 			if !entry.SegmentCache.Has(segmentKey) {
 				entry.SegmentDownloadSignals.LoadOrStore(segmentKey, make(chan struct{}))
@@ -191,13 +192,14 @@ func (m *MPDManager) updateSequence(entry *cache.MPDEntry) {
 	}
 }
 
-func (m *MPDManager) WaitForSegments(channelID string, segmentKeys []string, timeout time.Duration) error {
+func (m *MPDManager) WaitForSegments(requestCtx context.Context, channelID string, segmentKeys []string, timeout time.Duration) error {
 	cachedEntry, exists := m.GetCachedEntry(channelID)
 	if !exists {
+		m.Logger.Error("Channel entry not found in cache during WaitForSegments", "channel_id", channelID)
 		return fmt.Errorf("channel entry %s not found", channelID)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(requestCtx, timeout)
 	defer cancel()
 
 	for _, key := range segmentKeys {
@@ -209,13 +211,25 @@ func (m *MPDManager) WaitForSegments(channelID string, segmentKeys []string, tim
 			select {
 			case <-sig.(chan struct{}):
 				if !cachedEntry.SegmentCache.Has(key) {
-					return fmt.Errorf("segment %s download finished but not found in cache", key)
+					// This now indicates that the download failed or was cancelled,
+					// as the downloader signals completion regardless of the outcome.
+					err := fmt.Errorf("segment %s download failed or was cancelled", key)
+					m.Logger.Warn("WaitForSegments: detected failed download", "segment_key", key, "channel_id", channelID)
+					return err
 				}
 			case <-ctx.Done():
-				return fmt.Errorf("timed out waiting for segment %s", key)
+				err := fmt.Errorf("timed out waiting for segment %s", key)
+				m.Logger.Error("WaitForSegments: timed out", "segment_key", key, "channel_id", channelID, "timeout", timeout)
+				return err
 			}
 		} else {
-			return fmt.Errorf("no download signal found for segment %s", key)
+			// If the segment is not in the cache and there's no download signal,
+			// it implies that the segment was expected to be there but wasn't,
+			// or the signal was never created. This is a logic error.
+			// However, to prevent a fatal error for a client, we can log it
+			// and return an error, making the system more robust.
+			m.Logger.Error("No download signal found for a segment not in cache", "segment_key", key, "channel_id", channelID)
+			return fmt.Errorf("segment %s is not available and not being downloaded", key)
 		}
 	}
 	return nil

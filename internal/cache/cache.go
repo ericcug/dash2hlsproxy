@@ -40,6 +40,17 @@ func (sc *SegmentCache) Has(key string) bool {
 	return exists
 }
 
+// Prune 从缓存中删除所有不在提供的 validKeys map 中的分片
+func (sc *SegmentCache) Prune(validKeys map[string]struct{}) {
+	sc.Lock()
+	defer sc.Unlock()
+	for key := range sc.Segments {
+		if _, ok := validKeys[key]; !ok {
+			delete(sc.Segments, key)
+		}
+	}
+}
+
 // MPDEntry 代表一个缓存的 MPD 及其相关状态
 type MPDEntry struct {
 	Data                   *mpd.MPD
@@ -73,6 +84,11 @@ func (e *MPDEntry) SignalSegmentDownloaded(segmentKey string) {
 	if ch, ok := e.SegmentDownloadSignals.LoadAndDelete(segmentKey); ok {
 		close(ch.(chan struct{}))
 	}
+}
+
+// PruneSegments 清理此条目中的陈旧分片
+func (e *MPDEntry) PruneSegments(validSegments map[string]struct{}) {
+	e.SegmentCache.Prune(validSegments)
 }
 
 // Manager 管理 MPD 缓存

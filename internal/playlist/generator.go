@@ -161,8 +161,9 @@ func GenerateMediaPlaylists(logger *slog.Logger, mpdData *mpd.MPD, finalMPDURLSt
 
 	finalMPDURL, errParseMPDURL := url.Parse(finalMPDURLStr)
 	if errParseMPDURL != nil {
-		logger.Error("Error parsing finalMPDURLStr", "url", finalMPDURLStr, "error", errParseMPDURL)
-		return nil, nil, nil, fmt.Errorf("error parsing final MPD URL: %w", errParseMPDURL)
+		err := fmt.Errorf("error parsing final MPD URL: %w", errParseMPDURL)
+		logger.Error("Error parsing finalMPDURLStr", "url", finalMPDURLStr, "error", err)
+		return nil, nil, nil, err
 	}
 
 	for _, period := range mpdData.Periods {

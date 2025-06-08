@@ -50,7 +50,7 @@ func (appCtx *AppContext) hlsRouter(w http.ResponseWriter, r *http.Request) {
 
 	switch numSubParts {
 	case 0:
-		appCtx.masterPlaylistHandler(w, channelCfg)
+		appCtx.masterPlaylistHandler(w, r, channelCfg)
 	case 1:
 		if parts[1] == "key" {
 			appCtx.keyServerHandler(w, r, channelCfg)
@@ -64,9 +64,9 @@ func (appCtx *AppContext) hlsRouter(w http.ResponseWriter, r *http.Request) {
 		fileName := parts[3]
 
 		if strings.HasSuffix(fileName, ".m3u8") {
-			appCtx.mediaPlaylistHandler(w, channelCfg, streamType, qualityOrLang)
+			appCtx.mediaPlaylistHandler(w, r, channelCfg, streamType, qualityOrLang)
 		} else {
-			appCtx.segmentProxyHandler(w, channelCfg, streamType, qualityOrLang, fileName)
+			appCtx.segmentProxyHandler(w, r, channelCfg, streamType, qualityOrLang, fileName)
 		}
 	default:
 		appCtx.Logger.Warn("Unhandled HLS path structure", "path", path, "parts", len(parts))
@@ -74,9 +74,9 @@ func (appCtx *AppContext) hlsRouter(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (appCtx *AppContext) masterPlaylistHandler(w http.ResponseWriter, channelCfg *config.ChannelConfig) {
+func (appCtx *AppContext) masterPlaylistHandler(w http.ResponseWriter, r *http.Request, channelCfg *config.ChannelConfig) {
 	// 确保 MPD 数据和缓存的播放列表是最新的
-	_, _, err := appCtx.MPDManager.GetMPD(channelCfg)
+	_, _, err := appCtx.MPDManager.GetMPD(r.Context(), channelCfg)
 	if err != nil {
 		appCtx.Logger.Error("Failed to get MPD for master playlist", "channel_name", channelCfg.Name, "channel_id", channelCfg.ID, "error", err)
 		http.Error(w, "Failed to process MPD", http.StatusInternalServerError)
@@ -110,9 +110,9 @@ func (appCtx *AppContext) masterPlaylistHandler(w http.ResponseWriter, channelCf
 		"playlist_length", len(playlistContent))
 }
 
-func (appCtx *AppContext) mediaPlaylistHandler(w http.ResponseWriter, channelCfg *config.ChannelConfig, streamType string, qualityOrLang string) {
+func (appCtx *AppContext) mediaPlaylistHandler(w http.ResponseWriter, r *http.Request, channelCfg *config.ChannelConfig, streamType string, qualityOrLang string) {
 	// 确保 MPD 数据和缓存的播放列表是最新的
-	_, _, err := appCtx.MPDManager.GetMPD(channelCfg)
+	_, _, err := appCtx.MPDManager.GetMPD(r.Context(), channelCfg)
 	if err != nil {
 		appCtx.Logger.Error("Failed to get MPD for media playlist", "channel_name", channelCfg.Name, "channel_id", channelCfg.ID, "error", err)
 		http.Error(w, "Failed to process MPD", http.StatusInternalServerError)
@@ -153,7 +153,7 @@ func (appCtx *AppContext) mediaPlaylistHandler(w http.ResponseWriter, channelCfg
 	if len(requiredSegments) > 0 {
 		// 设置一个合理的超时时间，例如10秒
 		timeout := 10 * time.Second
-		err := appCtx.MPDManager.WaitForSegments(channelCfg.ID, requiredSegments, timeout)
+		err := appCtx.MPDManager.WaitForSegments(r.Context(), channelCfg.ID, requiredSegments, timeout)
 		if err != nil {
 			appCtx.Logger.Error("Error waiting for segments to be cached",
 				"key", mediaPlaylistKey,
@@ -169,7 +169,7 @@ func (appCtx *AppContext) mediaPlaylistHandler(w http.ResponseWriter, channelCfg
 	fmt.Fprint(w, playlistStr)
 }
 
-func (appCtx *AppContext) segmentProxyHandler(w http.ResponseWriter, channelCfg *config.ChannelConfig, streamType string, qualityOrLang string, segmentName string) {
+func (appCtx *AppContext) segmentProxyHandler(w http.ResponseWriter, r *http.Request, channelCfg *config.ChannelConfig, streamType string, qualityOrLang string, segmentName string) {
 	cachedEntry, exists := appCtx.MPDManager.GetCachedEntry(channelCfg.ID)
 	if !exists || cachedEntry.SegmentCache == nil {
 		appCtx.Logger.Error("Cached entry or SegmentCache not found for segment proxy", "channel_id", channelCfg.ID)

@@ -23,24 +23,26 @@ type CacheAccessor interface {
 
 // Downloader 管理分片下载
 type Downloader struct {
-	cacheAccessor   CacheAccessor
-	fetcher         *fetch.Fetcher
-	downloadQueue   chan *fetch.SegmentDownloadTask
-	activeDownloads chan struct{}
-	stopCh          chan struct{}
-	wg              sync.WaitGroup
-	logger          *slog.Logger
+	cacheAccessor          CacheAccessor
+	fetcher                *fetch.Fetcher
+	downloadQueue          chan *fetch.SegmentDownloadTask
+	activeDownloads        chan struct{}
+	stopCh                 chan struct{}
+	wg                     sync.WaitGroup
+	logger                 *slog.Logger
+	segmentDownloadTimeout time.Duration
 }
 
 // NewDownloader 创建一个新的 Downloader 实例
 func NewDownloader(logger *slog.Logger, accessor CacheAccessor, fetcher *fetch.Fetcher) *Downloader {
 	return &Downloader{
-		logger:          logger,
-		cacheAccessor:   accessor,
-		fetcher:         fetcher,
-		downloadQueue:   make(chan *fetch.SegmentDownloadTask, 200),
-		activeDownloads: make(chan struct{}, globalMaxConcurrentDownloads),
-		stopCh:          make(chan struct{}),
+		logger:                 logger,
+		cacheAccessor:          accessor,
+		fetcher:                fetcher,
+		downloadQueue:          make(chan *fetch.SegmentDownloadTask, 200),
+		activeDownloads:        make(chan struct{}, globalMaxConcurrentDownloads),
+		stopCh:                 make(chan struct{}),
+		segmentDownloadTimeout: 15 * time.Second, // 可配置的超时
 	}
 }
 
@@ -94,10 +96,15 @@ func (d *Downloader) worker(ctx context.Context) {
 				continue
 			}
 
-			data, contentType, err := d.fetcher.FetchSegment(task.UpstreamURL, task.UserAgent)
+			// 为每个下载任务创建一个带超时的上下文
+			downloadCtx, cancel := context.WithTimeout(ctx, d.segmentDownloadTimeout)
+			data, contentType, err := d.fetcher.FetchSegment(downloadCtx, task.UpstreamURL, task.UserAgent)
+			cancel() // 及时释放资源
 
 			if err != nil {
 				d.logger.Error("Downloader worker: Failed to download segment", "segment_key", task.SegmentKey, "channel_id", task.ChannelID, "error", err)
+				// 即使下载失败，也要发出信号以解除任何等待者的阻塞
+				d.signalDownloadCompletion(task.ChannelID, task.SegmentKey)
 			} else {
 				cachedEntry.StoreSegment(task.SegmentKey, &fetch.CachedSegment{
 					Data:        data,
@@ -105,9 +112,10 @@ func (d *Downloader) worker(ctx context.Context) {
 					FetchedAt:   time.Now(),
 				})
 				d.logger.Debug("Downloader worker: Successfully cached segment", "segment_key", task.SegmentKey, "channel_id", task.ChannelID)
+				// 仅在成功存储后发出信号
+				d.signalDownloadCompletion(task.ChannelID, task.SegmentKey)
 			}
 
-			d.signalDownloadCompletion(task.ChannelID, task.SegmentKey)
 			<-d.activeDownloads // Release slot
 
 		case <-d.stopCh:

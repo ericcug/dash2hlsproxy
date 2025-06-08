@@ -1,6 +1,7 @@
 package mpd
 
 import (
+	"context"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -110,38 +111,44 @@ type MPD struct {
 
 func parseDuration(dashDuration string) (time.Duration, error) {
 	if !strings.HasPrefix(dashDuration, "PT") {
-		return 0, fmt.Errorf("invalid DASH duration format: missing PT prefix: %s", dashDuration)
+		err := fmt.Errorf("invalid DASH duration format: missing PT prefix: %s", dashDuration)
+		slog.Error("Failed to parse DASH duration", "duration", dashDuration, "error", err)
+		return 0, err
 	}
 	trimmed := strings.TrimPrefix(dashDuration, "PT")
 	if strings.Contains(trimmed, "H") || strings.Contains(trimmed, "M") {
 		if strings.HasSuffix(trimmed, "S") && !strings.Contains(trimmed, "H") && !strings.Contains(trimmed, "M") {
 			return time.ParseDuration(strings.ToLower(trimmed))
 		}
-		return 0, fmt.Errorf("complex DASH duration parsing not yet fully implemented for: %s", dashDuration)
+		err := fmt.Errorf("complex DASH duration parsing not yet fully implemented for: %s", dashDuration)
+		slog.Error("Failed to parse complex DASH duration", "duration", dashDuration, "error", err)
+		return 0, err
 	}
 	return time.ParseDuration(strings.ToLower(trimmed))
 }
 
 func (m *MPD) GetMinimumUpdatePeriod() (time.Duration, error) {
 	if m.MinimumUpdatePeriod == "" {
-		return 0, fmt.Errorf("MinimumUpdatePeriod is not set in MPD")
+		err := fmt.Errorf("MinimumUpdatePeriod is not set in MPD")
+		slog.Warn("Cannot get MinimumUpdatePeriod", "error", err)
+		return 0, err
 	}
 	return parseDuration(m.MinimumUpdatePeriod)
 }
 
 func (m *MPD) GetMaxSegmentDuration() (time.Duration, error) {
 	if m.MaxSegmentDuration == "" {
-		return 0, fmt.Errorf("MaxSegmentDuration is not set in MPD and inference is not yet implemented")
+		err := fmt.Errorf("MaxSegmentDuration is not set in MPD and inference is not yet implemented")
+		slog.Warn("Cannot get MaxSegmentDuration", "error", err)
+		return 0, err
 	}
 	return parseDuration(m.MaxSegmentDuration)
 }
 
-func FetchAndParseMPD(initialMPDURL string, userAgent string) (string, *MPD, error) {
-	client := &http.Client{
-		Timeout: 15 * time.Second,
-	}
-	req, err := http.NewRequest("GET", initialMPDURL, nil)
+func FetchAndParseMPD(ctx context.Context, client *http.Client, initialMPDURL string, userAgent string) (string, *MPD, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", initialMPDURL, nil)
 	if err != nil {
+		slog.Error("Failed to create request for MPD", "url", initialMPDURL, "error", err)
 		return "", nil, fmt.Errorf("failed to create request for MPD: %w", err)
 	}
 	if userAgent != "" {
@@ -151,6 +158,7 @@ func FetchAndParseMPD(initialMPDURL string, userAgent string) (string, *MPD, err
 
 	resp, err := client.Do(req)
 	if err != nil {
+		slog.Error("Failed to fetch MPD", "url", initialMPDURL, "error", err)
 		return "", nil, fmt.Errorf("failed to fetch MPD from %s: %w", initialMPDURL, err)
 	}
 	defer resp.Body.Close()
@@ -159,11 +167,14 @@ func FetchAndParseMPD(initialMPDURL string, userAgent string) (string, *MPD, err
 
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		return finalMPDURL, nil, fmt.Errorf("failed to fetch MPD: status %s, initial_url %s, final_url %s, body: %s", resp.Status, initialMPDURL, finalMPDURL, string(bodyBytes))
+		err := fmt.Errorf("failed to fetch MPD: status %s, initial_url %s, final_url %s, body: %s", resp.Status, initialMPDURL, finalMPDURL, string(bodyBytes))
+		slog.Error("Failed to fetch MPD with non-200 status", "status", resp.Status, "initial_url", initialMPDURL, "final_url", finalMPDURL, "error", err)
+		return finalMPDURL, nil, err
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		slog.Error("Failed to read MPD response body", "url", finalMPDURL, "error", err)
 		return finalMPDURL, nil, fmt.Errorf("failed to read MPD response body: %w", err)
 	}
 
@@ -173,7 +184,9 @@ func FetchAndParseMPD(initialMPDURL string, userAgent string) (string, *MPD, err
 		if len(bodySnippet) > 512 {
 			bodySnippet = bodySnippet[:512] + "..."
 		}
-		return finalMPDURL, nil, fmt.Errorf("failed to unmarshal MPD XML: %w. XML Body Snippet: %s", err, bodySnippet)
+		err := fmt.Errorf("failed to unmarshal MPD XML: %w. XML Body Snippet: %s", err, bodySnippet)
+		slog.Error("Failed to unmarshal MPD XML", "url", finalMPDURL, "error", err)
+		return finalMPDURL, nil, err
 	}
 	return finalMPDURL, &mpdData, nil
 }

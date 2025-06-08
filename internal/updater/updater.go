@@ -153,7 +153,7 @@ func (s *Service) StartAutoUpdater(channelCfg *config.ChannelConfig, entry *cach
 		for {
 			select {
 			case <-ticker.C:
-				_, _, err := s.fetchAndProcessMPD(channelCfg, entry)
+				_, _, err := s.fetchAndProcessMPD(ctx, channelCfg, entry)
 				if err != nil {
 					s.Logger.Error("AutoUpdater: Error fetching/processing MPD. Will retry on next tick.", "error", err)
 					continue
@@ -178,7 +178,7 @@ func (s *Service) StartAutoUpdater(channelCfg *config.ChannelConfig, entry *cach
 }
 
 // fetchAndProcessMPD 是 updater 内部的方法，用于获取和处理 MPD 更新
-func (s *Service) fetchAndProcessMPD(channelCfg *config.ChannelConfig, entry *cache.MPDEntry) (string, *mpd.MPD, error) {
+func (s *Service) fetchAndProcessMPD(ctx context.Context, channelCfg *config.ChannelConfig, entry *cache.MPDEntry) (string, *mpd.MPD, error) {
 	entry.Mux.RLock()
 	urlToFetch := channelCfg.Manifest
 	if entry.FinalMPDURL != "" {
@@ -189,7 +189,7 @@ func (s *Service) fetchAndProcessMPD(channelCfg *config.ChannelConfig, entry *ca
 	entry.Mux.RUnlock()
 
 	newFinalURL, fetchedBaseURL, newMPDData, err := s.Fetcher.FetchMPDWithRetry(
-		urlToFetch, s.Config.UserAgent,
+		ctx, urlToFetch, s.Config.UserAgent,
 		initialBaseURL, initialBaseURLIsSet,
 	)
 	if err != nil {
