@@ -42,38 +42,54 @@ func NewFetcher(logger *slog.Logger, client *http.Client) *Fetcher {
 
 // FetchSegment 从指定的 URL 获取单个 SEGMENT
 func (f *Fetcher) FetchSegment(ctx context.Context, url string, userAgent string) ([]byte, string, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		err := fmt.Errorf("创建请求失败: %w", err)
-		f.Logger.Error("Failed to create segment request", "url", url, "error", err)
-		return nil, "", err
-	}
-	if userAgent != "" {
-		req.Header.Set("User-Agent", userAgent)
+	var data []byte
+	var contentType string
+	var err error
+	const maxRetries = 3
+	const retryDelay = 200 * time.Millisecond
+
+	for i := 0; i < maxRetries; i++ {
+		var req *http.Request
+		req, err = http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			err = fmt.Errorf("创建请求失败: %w", err)
+			f.Logger.Error("Failed to create segment request", "url", url, "error", err)
+			return nil, "", err
+		}
+		if userAgent != "" {
+			req.Header.Set("User-Agent", userAgent)
+		}
+
+		var resp *http.Response
+		resp, err = f.HttpClient.Do(req)
+		if err != nil {
+			err = fmt.Errorf("请求上游 SEGMENT 失败: %w", err)
+			f.Logger.Warn("Failed to fetch segment, retrying...", "url", url, "retry", i+1, "error", err)
+			time.Sleep(retryDelay)
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			err = fmt.Errorf("上游 SEGMENT 返回非 200 状态码: %s", resp.Status)
+			f.Logger.Warn("Upstream segment fetch returned non-200 status, retrying...", "url", url, "status", resp.Status, "retry", i+1)
+			time.Sleep(retryDelay)
+			continue
+		}
+
+		data, err = io.ReadAll(resp.Body)
+		if err != nil {
+			err = fmt.Errorf("读取 SEGMENT 数据失败: %w", err)
+			f.Logger.Warn("Failed to read segment data, retrying...", "url", url, "retry", i+1, "error", err)
+			time.Sleep(retryDelay)
+			continue
+		}
+		contentType = resp.Header.Get("Content-Type")
+		return data, contentType, nil // Success
 	}
 
-	resp, err := f.HttpClient.Do(req)
-	if err != nil {
-		err := fmt.Errorf("请求上游 SEGMENT 失败: %w", err)
-		f.Logger.Error("Failed to fetch segment", "url", url, "error", err)
-		return nil, "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		err := fmt.Errorf("上游 SEGMENT 返回非 200 状态码: %s", resp.Status)
-		f.Logger.Error("Upstream segment fetch returned non-200 status", "url", url, "status", resp.Status)
-		return nil, "", err
-	}
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		err := fmt.Errorf("读取 SEGMENT 数据失败: %w", err)
-		f.Logger.Error("Failed to read segment data", "url", url, "error", err)
-		return nil, "", err
-	}
-	contentType := resp.Header.Get("Content-Type")
-	return data, contentType, nil
+	f.Logger.Error("Failed to fetch segment after all retries", "url", url, "error", err)
+	return nil, "", err
 }
 
 // FetchMPDWithRetry 获取并解析 MPD，并在 baseURL 不匹配时重试
@@ -82,14 +98,29 @@ func (f *Fetcher) FetchMPDWithRetry(
 	initialFetchURL, userAgent, knownInitialBaseURL string,
 	isInitialBaseURLSet bool,
 ) (string, string, *mpd.MPD, error) {
-	finalURL, mpdObj, err := mpd.FetchAndParseMPD(ctx, f.HttpClient, initialFetchURL, userAgent)
+	var finalURL string
+	var mpdObj *mpd.MPD
+	var err error
+	const maxRetries = 3
+	const retryDelay = 500 * time.Millisecond
+
+	for i := 0; i < maxRetries; i++ {
+		finalURL, mpdObj, err = mpd.FetchAndParseMPD(ctx, f.HttpClient, initialFetchURL, userAgent)
+		if err == nil {
+			// Success
+			break
+		}
+		f.Logger.Warn("Failed to fetch MPD, retrying...", "url", initialFetchURL, "retry", i+1, "error", err)
+		time.Sleep(retryDelay)
+	}
+
 	if err != nil {
-		err := fmt.Errorf("initial fetch failed: %w", err)
+		err := fmt.Errorf("initial fetch failed after %d retries: %w", maxRetries, err)
 		f.Logger.Error("Initial MPD fetch failed", "url", initialFetchURL, "error", err)
 		return initialFetchURL, "", nil, err
 	}
-	var actualBaseURL string
 
+	var actualBaseURL string
 	if mpdObj != nil && len(mpdObj.BaseURLs) > 0 && mpdObj.BaseURLs[0] != "" {
 		actualBaseURL = mpdObj.BaseURLs[0]
 	}
