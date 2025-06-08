@@ -46,9 +46,13 @@ func (f *Fetcher) FetchSegment(ctx context.Context, url string, userAgent string
 	var contentType string
 	var err error
 	const maxRetries = 3
-	const retryDelay = 200 * time.Millisecond
 
 	for i := 0; i < maxRetries; i++ {
+		if i > 0 {
+			// Exponential backoff: 1s, 2s
+			time.Sleep(time.Second * time.Duration(1<<(i-1)))
+		}
+
 		var req *http.Request
 		req, err = http.NewRequestWithContext(ctx, "GET", url, nil)
 		if err != nil {
@@ -65,7 +69,6 @@ func (f *Fetcher) FetchSegment(ctx context.Context, url string, userAgent string
 		if err != nil {
 			err = fmt.Errorf("请求上游 SEGMENT 失败: %w", err)
 			f.Logger.Warn("Failed to fetch segment, retrying...", "url", url, "retry", i+1, "error", err)
-			time.Sleep(retryDelay)
 			continue
 		}
 		defer resp.Body.Close()
@@ -73,7 +76,6 @@ func (f *Fetcher) FetchSegment(ctx context.Context, url string, userAgent string
 		if resp.StatusCode != http.StatusOK {
 			err = fmt.Errorf("上游 SEGMENT 返回非 200 状态码: %s", resp.Status)
 			f.Logger.Warn("Upstream segment fetch returned non-200 status, retrying...", "url", url, "status", resp.Status, "retry", i+1)
-			time.Sleep(retryDelay)
 			continue
 		}
 
@@ -81,7 +83,6 @@ func (f *Fetcher) FetchSegment(ctx context.Context, url string, userAgent string
 		if err != nil {
 			err = fmt.Errorf("读取 SEGMENT 数据失败: %w", err)
 			f.Logger.Warn("Failed to read segment data, retrying...", "url", url, "retry", i+1, "error", err)
-			time.Sleep(retryDelay)
 			continue
 		}
 		contentType = resp.Header.Get("Content-Type")
@@ -102,16 +103,18 @@ func (f *Fetcher) FetchMPDWithRetry(
 	var mpdObj *mpd.MPD
 	var err error
 	const maxRetries = 3
-	const retryDelay = 500 * time.Millisecond
 
 	for i := 0; i < maxRetries; i++ {
+		if i > 0 {
+			// Exponential backoff: 1s, 2s
+			time.Sleep(time.Second * time.Duration(1<<(i-1)))
+		}
 		finalURL, mpdObj, err = mpd.FetchAndParseMPD(ctx, f.HttpClient, initialFetchURL, userAgent)
 		if err == nil {
 			// Success
 			break
 		}
 		f.Logger.Warn("Failed to fetch MPD, retrying...", "url", initialFetchURL, "retry", i+1, "error", err)
-		time.Sleep(retryDelay)
 	}
 
 	if err != nil {

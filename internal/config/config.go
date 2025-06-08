@@ -31,6 +31,7 @@ type AppConfig struct {
 	MediaPlaylistSegmentTimeout  int             `json:"MediaPlaylistSegmentTimeout"`
 	InitSegmentCacheTTLSeconds   int             `json:"InitSegmentCacheTTLSeconds"`
 	LivePlaylistDuration         int             `json:"LivePlaylistDuration"`
+	ChannelCacheTimeoutMinutes   int             `json:"ChannelCacheTimeoutMinutes"`
 
 	// ChannelMap 提供按频道 ID 快速查找频道的功能。
 	// 这是在加载配置后填充的。
@@ -52,6 +53,11 @@ func LoadConfig(filePath string) (*AppConfig, error) {
 		err := fmt.Errorf("failed to unmarshal channels JSON from %s: %w", filePath, err)
 		slog.Error("Failed to unmarshal config JSON", "path", filePath, "error", err)
 		return nil, err
+	}
+
+	// Set default values for new fields if they are not in the JSON
+	if cfg.ChannelCacheTimeoutMinutes == 0 {
+		cfg.ChannelCacheTimeoutMinutes = 1440 // 24 hours
 	}
 
 	cfg.ChannelMap = make(map[string]*ChannelConfig)

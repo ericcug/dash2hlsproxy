@@ -8,38 +8,44 @@ import (
 
 	"dash2hlsproxy/internal/cache"
 	"dash2hlsproxy/internal/config"
-	"dash2hlsproxy/internal/fetch"
-	"dash2hlsproxy/internal/mpd"
-	"dash2hlsproxy/internal/playlist"
 )
+
+// manager is an interface that defines the methods the updater service needs
+// to interact with the MPDManager. This avoids a circular dependency.
+type manager interface {
+	ForceUpdateChannel(ctx context.Context, channelID string) error
+	GetCachedEntry(channelID string) (*cache.MPDEntry, bool)
+	Config() *config.AppConfig
+	DeleteEntry(channelID string)
+}
 
 // Service 负责后台任务，如自动更新和清理
 type Service struct {
-	Config     *config.AppConfig
-	Logger     *slog.Logger
-	Cache      *cache.Manager
-	Fetcher    *fetch.Fetcher
-	Downloader interface {
-		EnqueueTask(*fetch.SegmentDownloadTask)
-	}
+	Config  *config.AppConfig
+	Logger  *slog.Logger
+	Manager manager
+	Cache   *cache.Manager // Keep a direct reference to Cache for janitor
 }
 
 // NewService 创建一个新的 Updater 服务
-func NewService(cfg *config.AppConfig, logger *slog.Logger, cache *cache.Manager, fetcher *fetch.Fetcher, downloader interface {
-	EnqueueTask(*fetch.SegmentDownloadTask)
-}) *Service {
+func NewService(cfg *config.AppConfig, logger *slog.Logger, m manager) *Service {
+	type cacheProvider interface {
+		GetCache() *cache.Manager
+	}
+	cacheManager, _ := m.(cacheProvider)
+
 	return &Service{
-		Config:     cfg,
-		Logger:     logger,
-		Cache:      cache,
-		Fetcher:    fetcher,
-		Downloader: downloader,
+		Config:  cfg,
+		Logger:  logger,
+		Manager: m,
+		Cache:   cacheManager.GetCache(),
 	}
 }
 
 // StartJanitor 启动一个定期清理过期缓存的协程
 func (s *Service) StartJanitor(ctx context.Context) {
 	s.Logger.Info("Starting janitor...")
+	// Use a configurable interval later if needed
 	ticker := time.NewTicker(1 * time.Minute)
 	go func() {
 		defer ticker.Stop()
@@ -56,14 +62,45 @@ func (s *Service) StartJanitor(ctx context.Context) {
 }
 
 func (s *Service) runJanitor() {
-	const maxSegmentAge = 5 * time.Minute
+	if s.Cache == nil {
+		s.Logger.Error("Janitor: Cache is not initialized, cannot run cleanup.")
+		return
+	}
 
 	s.Cache.CacheLock.RLock()
-	defer s.Cache.CacheLock.RUnlock()
+	allChannelIDs := make([]string, 0, len(s.Cache.MPDCache))
+	for channelID := range s.Cache.MPDCache {
+		allChannelIDs = append(allChannelIDs, channelID)
+	}
+	s.Cache.CacheLock.RUnlock()
 
-	for channelID, cachedEntry := range s.Cache.MPDCache {
-		// 1. 为不活跃的动态频道停止自动更新
+	timeoutMinutes := time.Duration(s.Manager.Config().ChannelCacheTimeoutMinutes) * time.Minute
+	if timeoutMinutes <= 0 {
+		timeoutMinutes = 1440 * time.Minute // Default to 24 hours if not set
+	}
+
+	for _, channelID := range allChannelIDs {
+		cachedEntry, exists := s.Manager.GetCachedEntry(channelID)
+		if !exists {
+			continue
+		}
+
 		cachedEntry.Mux.Lock()
+
+		// 1. Evict entire channel entry if it hasn't been accessed in a long time
+		if time.Since(cachedEntry.LastAccessedAt) > timeoutMinutes {
+			s.Logger.Info("Channel cache timed out. Evicting entry.", "channel_id", channelID, "last_accessed", cachedEntry.LastAccessedAt)
+			// Ensure auto-updater is stopped before evicting
+			if cachedEntry.StopAutoUpdateCh != nil {
+				close(cachedEntry.StopAutoUpdateCh)
+				cachedEntry.StopAutoUpdateCh = nil
+			}
+			cachedEntry.Mux.Unlock() // Unlock before calling DeleteEntry to avoid deadlock
+			s.Manager.DeleteEntry(channelID)
+			continue // Move to the next channel
+		}
+
+		// 2. For active dynamic channels, stop auto-updater if inactive for a shorter period
 		if cachedEntry.Data != nil && cachedEntry.Data.Type == "dynamic" && cachedEntry.StopAutoUpdateCh != nil {
 			minUpdatePeriod, err := cachedEntry.Data.GetMinimumUpdatePeriod()
 			if err == nil {
@@ -74,18 +111,21 @@ func (s *Service) runJanitor() {
 				if time.Since(cachedEntry.LastAccessedAt) > inactivityThreshold {
 					s.Logger.Info("Channel inactive, stopping auto-updater.", "channel_id", channelID)
 					close(cachedEntry.StopAutoUpdateCh)
-					cachedEntry.StopAutoUpdateCh = nil // 标记为已停止
+					cachedEntry.StopAutoUpdateCh = nil // Mark as stopped
 				}
 			}
 		}
+
 		cachedEntry.Mux.Unlock()
 
-		// 2. 清理过期的分片
-		s.cleanupExpiredSegments(channelID, cachedEntry, maxSegmentAge)
+		// 3. Cleanup expired segments for the entry
+		s.cleanupExpiredSegments(channelID, cachedEntry)
 	}
 }
 
-func (s *Service) cleanupExpiredSegments(channelID string, cachedEntry *cache.MPDEntry, maxAge time.Duration) {
+func (s *Service) cleanupExpiredSegments(channelID string, cachedEntry *cache.MPDEntry) {
+	const maxSegmentAge = 5 * time.Minute
+
 	cachedEntry.Mux.RLock()
 	playlists := make([]string, 0, len(cachedEntry.MediaPlaylists))
 	for _, pl := range cachedEntry.MediaPlaylists {
@@ -112,7 +152,7 @@ func (s *Service) cleanupExpiredSegments(channelID string, cachedEntry *cache.MP
 	initialCount := len(segmentCache.Segments)
 	keysToDelete := make([]string, 0)
 	for key, segment := range segmentCache.Segments {
-		if _, isValid := validSegments[key]; !isValid && time.Since(segment.FetchedAt) > maxAge {
+		if _, isValid := validSegments[key]; !isValid && time.Since(segment.FetchedAt) > maxSegmentAge {
 			keysToDelete = append(keysToDelete, key)
 		}
 	}
@@ -130,8 +170,8 @@ func (s *Service) cleanupExpiredSegments(channelID string, cachedEntry *cache.MP
 }
 
 // StartAutoUpdater 启动一个自动更新 MPD 的协程
-func (s *Service) StartAutoUpdater(channelCfg *config.ChannelConfig, entry *cache.MPDEntry, initialMinUpdatePeriod time.Duration) {
-	s.Logger.Info("Starting AutoUpdater for dynamic channel", "channel_id", channelCfg.ID, "update_period", initialMinUpdatePeriod)
+func (s *Service) StartAutoUpdater(channelID string, entry *cache.MPDEntry, initialMinUpdatePeriod time.Duration) {
+	s.Logger.Info("Starting AutoUpdater for dynamic channel", "channel_id", channelID, "update_period", initialMinUpdatePeriod)
 	entry.StopAutoUpdateCh = make(chan struct{})
 
 	go func() {
@@ -141,7 +181,6 @@ func (s *Service) StartAutoUpdater(channelCfg *config.ChannelConfig, entry *cach
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		// 监听停止信号
 		go func() {
 			select {
 			case <-entry.StopAutoUpdateCh:
@@ -153,177 +192,30 @@ func (s *Service) StartAutoUpdater(channelCfg *config.ChannelConfig, entry *cach
 		for {
 			select {
 			case <-ticker.C:
-				_, _, err := s.fetchAndProcessMPD(ctx, channelCfg, entry)
+				err := s.Manager.ForceUpdateChannel(ctx, channelID)
 				if err != nil {
-					s.Logger.Error("AutoUpdater: Error fetching/processing MPD. Will retry on next tick.", "error", err)
+					s.Logger.Error("AutoUpdater: Error updating channel data. Will retry on next tick.", "channel_id", channelID, "error", err)
 					continue
 				}
 
 				entry.Mux.RLock()
+				if entry.Data == nil {
+					entry.Mux.RUnlock()
+					continue
+				}
 				newMup, mupErr := entry.Data.GetMinimumUpdatePeriod()
 				entry.Mux.RUnlock()
 
 				if mupErr == nil && newMup > 0 && newMup != initialMinUpdatePeriod {
 					ticker.Reset(newMup)
 					initialMinUpdatePeriod = newMup
-					s.Logger.Info("AutoUpdater: Updated refresh interval", "channel_id", channelCfg.ID, "new_period", newMup)
+					s.Logger.Info("AutoUpdater: Updated refresh interval", "channel_id", channelID, "new_period", newMup)
 				}
 
 			case <-ctx.Done():
-				s.Logger.Info("AutoUpdater: Stop signal received. Exiting.", "channel_id", channelCfg.ID)
+				s.Logger.Info("AutoUpdater: Stop signal received. Exiting.", "channel_id", channelID)
 				return
 			}
 		}
 	}()
-}
-
-// fetchAndProcessMPD 是 updater 内部的方法，用于获取和处理 MPD 更新
-func (s *Service) fetchAndProcessMPD(ctx context.Context, channelCfg *config.ChannelConfig, entry *cache.MPDEntry) (string, *mpd.MPD, error) {
-	entry.Mux.RLock()
-	urlToFetch := channelCfg.Manifest
-	if entry.FinalMPDURL != "" {
-		urlToFetch = entry.FinalMPDURL
-	}
-	initialBaseURL := entry.InitialBaseURL
-	initialBaseURLIsSet := entry.InitialBaseURLIsSet
-	entry.Mux.RUnlock()
-
-	newFinalURL, fetchedBaseURL, newMPDData, err := s.Fetcher.FetchMPDWithRetry(
-		ctx, urlToFetch, s.Config.UserAgent,
-		initialBaseURL, initialBaseURLIsSet,
-	)
-	if err != nil {
-		return "", nil, err
-	}
-
-	entry.Mux.Lock()
-	defer entry.Mux.Unlock()
-
-	if entry.Data != nil {
-		newPublishTime, _ := fetch.ParsePublishTime(newMPDData.PublishTime)
-		cachedPublishTime, _ := fetch.ParsePublishTime(entry.Data.PublishTime)
-		if !newPublishTime.IsZero() && !cachedPublishTime.IsZero() && !newPublishTime.After(cachedPublishTime) {
-			return entry.FinalMPDURL, entry.Data, nil
-		}
-	}
-
-	entry.Data = newMPDData
-	entry.FetchedAt = time.Now()
-	entry.FinalMPDURL = newFinalURL
-	if !entry.InitialBaseURLIsSet {
-		entry.InitialBaseURL = fetchedBaseURL
-		entry.InitialBaseURLIsSet = true
-	}
-
-	s.updateSequence(entry)
-	s.processMPDUpdates(channelCfg, entry)
-
-	return newFinalURL, newMPDData, nil
-}
-
-func (s *Service) processMPDUpdates(channelCfg *config.ChannelConfig, entry *cache.MPDEntry) {
-	masterPl, selectedRepIDs, err := playlist.GenerateMasterPlaylist(entry.Data, channelCfg.ID)
-	if err != nil {
-		s.Logger.Error("Error generating master playlist", "channel_id", channelCfg.ID, "error", err)
-		return
-	}
-	entry.MasterPlaylist = masterPl
-
-	livePlaylistDuration := s.Config.LivePlaylistDuration
-	if livePlaylistDuration <= 0 {
-		livePlaylistDuration = 30 // Fallback to a default value of 30 seconds
-	}
-	mediaPls, segmentsToPreload, _, err := playlist.GenerateMediaPlaylists(s.Logger, entry.Data, entry.FinalMPDURL, channelCfg.ID, entry.HLSBaseMediaSequence, channelCfg.ParsedKey, selectedRepIDs, livePlaylistDuration)
-	if err != nil {
-		s.Logger.Error("Error generating media playlists", "channel_id", channelCfg.ID, "error", err)
-	} else {
-		entry.MediaPlaylists = mediaPls
-		for segmentKey, upstreamURL := range segmentsToPreload {
-			if !entry.SegmentCache.Has(segmentKey) {
-				entry.SegmentDownloadSignals.LoadOrStore(segmentKey, make(chan struct{}))
-				s.Downloader.EnqueueTask(&fetch.SegmentDownloadTask{
-					ChannelID:   channelCfg.ID,
-					SegmentKey:  segmentKey,
-					UpstreamURL: upstreamURL,
-					UserAgent:   s.Config.UserAgent,
-				})
-			}
-		}
-	}
-}
-
-func (s *Service) updateSequence(entry *cache.MPDEntry) {
-	newPublishTime, ptErr := fetch.ParsePublishTime(entry.Data.PublishTime)
-	if ptErr != nil {
-		s.Logger.Warn("Could not parse PublishTime, sequence not updated", "publish_time", entry.Data.PublishTime, "error", ptErr)
-		return
-	}
-
-	if entry.LastMPDPublishTime.IsZero() {
-		entry.LastMPDPublishTime = newPublishTime
-		entry.LastSegmentTimes = collectSegmentTimes(entry.Data)
-		return
-	}
-
-	if !newPublishTime.After(entry.LastMPDPublishTime) {
-		return
-	}
-
-	newSegmentTimes := collectSegmentTimes(entry.Data)
-	hasNewSegments := false
-	for timeKey := range newSegmentTimes {
-		if _, exists := entry.LastSegmentTimes[timeKey]; !exists {
-			hasNewSegments = true
-			break
-		}
-	}
-
-	if hasNewSegments {
-		s.Logger.Debug("New segments detected, incrementing HLS base media sequence.", "channel_id", entry.Data.Periods[0].ID)
-		entry.HLSBaseMediaSequence++
-	}
-
-	entry.LastMPDPublishTime = newPublishTime
-	entry.LastSegmentTimes = newSegmentTimes
-}
-
-// collectSegmentTimes 从 MPD 中提取所有分片的开始时间，并以 map 的形式返回以便快速查找。
-func collectSegmentTimes(mpdData *mpd.MPD) map[uint64]struct{} {
-	times := make(map[uint64]struct{})
-	if mpdData == nil {
-		return times
-	}
-
-	for _, period := range mpdData.Periods {
-		for _, as := range period.AdaptationSets {
-			segTemplate := as.SegmentTemplate
-			for _, rep := range as.Representations {
-				if rep.SegmentTemplate != nil {
-					segTemplate = rep.SegmentTemplate
-				}
-
-				if segTemplate != nil && segTemplate.SegmentTimeline != nil {
-					currentStartTime := uint64(0)
-					if len(segTemplate.SegmentTimeline.Segments) > 0 && segTemplate.SegmentTimeline.Segments[0].T != nil {
-						currentStartTime = *segTemplate.SegmentTimeline.Segments[0].T
-					}
-
-					for _, s := range segTemplate.SegmentTimeline.Segments {
-						if s.T != nil {
-							currentStartTime = *s.T
-						}
-						repeatCount := 0
-						if s.R != nil {
-							repeatCount = *s.R
-						}
-						for rIdx := 0; rIdx <= repeatCount; rIdx++ {
-							times[currentStartTime] = struct{}{}
-							currentStartTime += s.D
-						}
-					}
-				}
-			}
-		}
-	}
-	return times
 }
