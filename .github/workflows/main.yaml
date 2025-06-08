@@ -18,8 +18,10 @@ jobs:
         include:
           - platform: linux/amd64
             runs-on: ubuntu-24.04
+            arch: amd64
           - platform: linux/arm64
             runs-on: ubuntu-24.04-arm
+            arch: arm64
     steps:
     - uses: actions/checkout@v4
     
@@ -44,6 +46,29 @@ jobs:
         platforms: ${{ matrix.platform }}
         push: true
         provenance: false
-        tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+        tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest-${{ matrix.arch }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
+
+  push-manifest:
+    needs: build-and-push
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Prepare image name
+        run: echo "IMAGE_NAME=$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
+      - name: Create and push manifest
+        run: |
+          docker manifest create ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+            --amend ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest-amd64 \
+            --amend ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest-arm64
+          docker manifest push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
