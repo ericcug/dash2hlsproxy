@@ -97,6 +97,13 @@ func (appCtx *AppContext) masterPlaylistHandler(w http.ResponseWriter, r *http.R
 		for _, line := range strings.Split(playlistStr, "\n") {
 			if strings.HasPrefix(line, "/hls/") {
 				requiredSegments = append(requiredSegments, line)
+			} else if strings.HasPrefix(line, "#EXT-X-MAP:URI=") {
+				// Example: #EXT-X-MAP:URI="/hls/jade/video/v5000000_33/init.m4s"
+				uriPart := strings.TrimPrefix(line, "#EXT-X-MAP:URI=")
+				uriPart = strings.Trim(uriPart, "\"")
+				if strings.HasPrefix(uriPart, "/hls/") {
+					requiredSegments = append(requiredSegments, uriPart)
+				}
 			}
 		}
 		appCtx.Logger.Debug("Collected segments from media playlist", "key", key)
@@ -105,8 +112,11 @@ func (appCtx *AppContext) masterPlaylistHandler(w http.ResponseWriter, r *http.R
 
 	if len(requiredSegments) > 0 {
 		// 设置一个足够长的超时时间，以等待所有分片缓存
-		timeout := 20 * time.Second
-		err := appCtx.MPDManager.WaitForSegments(r.Context(), channelCfg.ID, requiredSegments, timeout)
+		timeoutDuration := 20 * time.Second
+		if appCtx.Config.MasterPlaylistSegmentTimeout > 0 {
+			timeoutDuration = time.Duration(appCtx.Config.MasterPlaylistSegmentTimeout) * time.Second
+		}
+		err := appCtx.MPDManager.WaitForSegments(r.Context(), channelCfg.ID, requiredSegments, timeoutDuration)
 		if err != nil {
 			logMessage := "Error waiting for all segments to be cached for master playlist"
 			if strings.Contains(err.Error(), "timed out") {
@@ -116,7 +126,8 @@ func (appCtx *AppContext) masterPlaylistHandler(w http.ResponseWriter, r *http.R
 			}
 			appCtx.Logger.Error(logMessage,
 				"channel_id", channelCfg.ID,
-				"error", err)
+				"error", err,
+				"timeout", timeoutDuration)
 			http.Error(w, "Failed to cache all necessary segments in time", http.StatusServiceUnavailable)
 			return
 		}
@@ -180,13 +191,22 @@ func (appCtx *AppContext) mediaPlaylistHandler(w http.ResponseWriter, r *http.Re
 	for _, line := range strings.Split(playlistStr, "\n") {
 		if strings.HasPrefix(line, "/hls/") {
 			requiredSegments = append(requiredSegments, line)
+		} else if strings.HasPrefix(line, "#EXT-X-MAP:URI=") {
+			uriPart := strings.TrimPrefix(line, "#EXT-X-MAP:URI=")
+			uriPart = strings.Trim(uriPart, "\"")
+			if strings.HasPrefix(uriPart, "/hls/") {
+				requiredSegments = append(requiredSegments, uriPart)
+			}
 		}
 	}
 
 	if len(requiredSegments) > 0 {
 		// 设置一个足够长的超时时间，以等待所有分片缓存
-		timeout := 10 * time.Second
-		err := appCtx.MPDManager.WaitForSegments(r.Context(), channelCfg.ID, requiredSegments, timeout)
+		timeoutDuration := 10 * time.Second
+		if appCtx.Config.MediaPlaylistSegmentTimeout > 0 {
+			timeoutDuration = time.Duration(appCtx.Config.MediaPlaylistSegmentTimeout) * time.Second
+		}
+		err := appCtx.MPDManager.WaitForSegments(r.Context(), channelCfg.ID, requiredSegments, timeoutDuration)
 		if err != nil {
 			logMessage := "Error waiting for segments for media playlist"
 			if strings.Contains(err.Error(), "timed out") {
@@ -197,7 +217,8 @@ func (appCtx *AppContext) mediaPlaylistHandler(w http.ResponseWriter, r *http.Re
 			appCtx.Logger.Error(logMessage,
 				"channel_id", channelCfg.ID,
 				"key", mediaPlaylistKey,
-				"error", err)
+				"error", err,
+				"timeout", timeoutDuration)
 			http.Error(w, "Failed to cache necessary segments in time", http.StatusServiceUnavailable)
 			return
 		}

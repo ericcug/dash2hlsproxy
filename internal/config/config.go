@@ -23,10 +23,12 @@ type ChannelConfig struct {
 
 // AppConfig 保存整个应用程序的配置，包括所有频道。
 type AppConfig struct {
-	Name      string          `json:"Name"`
-	ID        string          `json:"Id"`
-	Channels  []ChannelConfig `json:"Channels"`
-	UserAgent string          `json:"UserAgent"`
+	Name                         string          `json:"Name"`
+	ID                           string          `json:"Id"`
+	Channels                     []ChannelConfig `json:"Channels"`
+	UserAgent                    string          `json:"UserAgent"`
+	MasterPlaylistSegmentTimeout int             `json:"MasterPlaylistSegmentTimeout"`
+	MediaPlaylistSegmentTimeout  int             `json:"MediaPlaylistSegmentTimeout"`
 
 	// ChannelMap 提供按频道 ID 快速查找频道的功能。
 	// 这是在加载配置后填充的。
