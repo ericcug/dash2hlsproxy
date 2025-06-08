@@ -29,6 +29,7 @@ type AppConfig struct {
 	UserAgent                    string          `json:"UserAgent"`
 	MasterPlaylistSegmentTimeout int             `json:"MasterPlaylistSegmentTimeout"`
 	MediaPlaylistSegmentTimeout  int             `json:"MediaPlaylistSegmentTimeout"`
+	InitSegmentCacheTTLSeconds   int             `json:"InitSegmentCacheTTLSeconds"`
 
 	// ChannelMap 提供按频道 ID 快速查找频道的功能。
 	// 这是在加载配置后填充的。

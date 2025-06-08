@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"strings"
 	"sync"
 	"time"
 
@@ -41,12 +42,19 @@ func (sc *SegmentCache) Has(key string) bool {
 }
 
 // Prune 从缓存中删除所有不在提供的 validKeys map 中的分片
-func (sc *SegmentCache) Prune(validKeys map[string]struct{}) {
+func (sc *SegmentCache) Prune(validKeys map[string]struct{}, initSegmentTTL time.Duration) {
 	sc.Lock()
 	defer sc.Unlock()
-	for key := range sc.Segments {
+	for key, segment := range sc.Segments {
 		if _, ok := validKeys[key]; !ok {
-			delete(sc.Segments, key)
+			// 对于 init.m4s 文件，我们希望它在缓存中保留更长时间
+			if strings.HasSuffix(key, "init.m4s") {
+				if time.Since(segment.FetchedAt) > initSegmentTTL {
+					delete(sc.Segments, key)
+				}
+			} else {
+				delete(sc.Segments, key)
+			}
 		}
 	}
 }
@@ -87,8 +95,8 @@ func (e *MPDEntry) SignalSegmentDownloaded(segmentKey string) {
 }
 
 // PruneSegments 清理此条目中的陈旧分片
-func (e *MPDEntry) PruneSegments(validSegments map[string]struct{}) {
-	e.SegmentCache.Prune(validSegments)
+func (e *MPDEntry) PruneSegments(validSegments map[string]struct{}, initSegmentTTL time.Duration) {
+	e.SegmentCache.Prune(validSegments, initSegmentTTL)
 }
 
 // Manager 管理 MPD 缓存

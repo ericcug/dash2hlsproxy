@@ -163,7 +163,8 @@ func (m *MPDManager) processMPDUpdates(channelCfg *config.ChannelConfig, entry *
 		m.Logger.Error("Error generating media playlists", "channel_id", channelCfg.ID, "error", err)
 	} else {
 		entry.MediaPlaylists = mediaPls
-		entry.PruneSegments(validSegments) // Prune old segments
+		initSegmentTTL := time.Duration(m.Config.InitSegmentCacheTTLSeconds) * time.Second
+		entry.PruneSegments(validSegments, initSegmentTTL) // Prune old segments
 		for segmentKey, upstreamURL := range segmentsToPreload {
 			if !entry.SegmentCache.Has(segmentKey) {
 				entry.SegmentDownloadSignals.LoadOrStore(segmentKey, make(chan struct{}))
