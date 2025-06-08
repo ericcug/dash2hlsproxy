@@ -108,7 +108,13 @@ func (appCtx *AppContext) masterPlaylistHandler(w http.ResponseWriter, r *http.R
 		timeout := 20 * time.Second
 		err := appCtx.MPDManager.WaitForSegments(r.Context(), channelCfg.ID, requiredSegments, timeout)
 		if err != nil {
-			appCtx.Logger.Error("Error waiting for all segments to be cached for master playlist",
+			logMessage := "Error waiting for all segments to be cached for master playlist"
+			if strings.Contains(err.Error(), "timed out") {
+				logMessage = "Timeout waiting for all segments to be cached for master playlist"
+			} else if strings.Contains(err.Error(), "download failed") {
+				logMessage = "Failed to download all segments for master playlist"
+			}
+			appCtx.Logger.Error(logMessage,
 				"channel_id", channelCfg.ID,
 				"error", err)
 			http.Error(w, "Failed to cache all necessary segments in time", http.StatusServiceUnavailable)
@@ -168,6 +174,36 @@ func (appCtx *AppContext) mediaPlaylistHandler(w http.ResponseWriter, r *http.Re
 	}
 
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+
+	// --- 新增逻辑：等待此媒体播放列表的所有分片都准备就绪 ---
+	var requiredSegments []string
+	for _, line := range strings.Split(playlistStr, "\n") {
+		if strings.HasPrefix(line, "/hls/") {
+			requiredSegments = append(requiredSegments, line)
+		}
+	}
+
+	if len(requiredSegments) > 0 {
+		// 设置一个足够长的超时时间，以等待所有分片缓存
+		timeout := 10 * time.Second
+		err := appCtx.MPDManager.WaitForSegments(r.Context(), channelCfg.ID, requiredSegments, timeout)
+		if err != nil {
+			logMessage := "Error waiting for segments for media playlist"
+			if strings.Contains(err.Error(), "timed out") {
+				logMessage = "Timeout waiting for segments for media playlist"
+			} else if strings.Contains(err.Error(), "download failed") {
+				logMessage = "Failed to download segments for media playlist"
+			}
+			appCtx.Logger.Error(logMessage,
+				"channel_id", channelCfg.ID,
+				"key", mediaPlaylistKey,
+				"error", err)
+			http.Error(w, "Failed to cache necessary segments in time", http.StatusServiceUnavailable)
+			return
+		}
+	}
+	// --- 结束新增逻辑 ---
+
 	fmt.Fprint(w, playlistStr)
 }
 
